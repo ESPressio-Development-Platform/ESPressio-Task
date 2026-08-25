@@ -1,0 +1,19 @@
+name: Task Build
+
+on:
+  push:
+    branches: [ main, 'feature/**', 'bugfix/**', 'optimisation/**' ]
+  pull_request:
+
+jobs:
+  esp32-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Compile example
+        run: pio ci examples/Basic/src/main.cpp --lib="." --board=esp32dev
