@@ -2,34 +2,46 @@
 
 #include <cstdint>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include <ESPressio_Execution.hpp>
 
 #include "ESPressio_TaskTypes.hpp"
 
 namespace ESPressio {
 namespace Task {
 
-using NativeTaskHandle = TaskHandle_t;
-using NativeTaskEntry = TaskFunction_t;
+using TaskHandle = System::Execution::ExecutionHandle;
+using TaskEntry = System::Execution::ExecutionEntry;
 
-struct NativeTaskCreationResult {
+struct TaskCreationResult {
     TaskExecutionStatus Status = TaskExecutionStatus::TaskCreationFailed;
-    NativeTaskHandle Handle = nullptr;
+    TaskHandle Handle = System::Execution::InvalidExecutionHandle;
 
-    explicit operator bool() const {
-        return Status == TaskExecutionStatus::Success && Handle != nullptr;
+    explicit operator bool() const noexcept {
+        return Status == TaskExecutionStatus::Success &&
+            Handle != System::Execution::InvalidExecutionHandle;
     }
 };
 
 class TaskRuntime {
+private:
+    static TaskExecutionStatus MapCreationStatus(System::PlatformStatus status) noexcept {
+        switch (status) {
+            case System::PlatformStatus::Success:
+                return TaskExecutionStatus::Success;
+            case System::PlatformStatus::InvalidArgument:
+                return TaskExecutionStatus::InvalidConfiguration;
+            default:
+                return TaskExecutionStatus::TaskCreationFailed;
+        }
+    }
+
 public:
-    static NativeTaskCreationResult Create(
-        NativeTaskEntry entry,
+    static TaskCreationResult Create(
+        TaskEntry entry,
         void* parameter,
         const TaskConfiguration& configuration
     ) {
-        NativeTaskCreationResult result;
+        TaskCreationResult result;
         if (entry == nullptr || configuration.StackSize == 0) {
             result.Status = TaskExecutionStatus::InvalidConfiguration;
             return result;
@@ -39,53 +51,50 @@ public:
             return result;
         }
 
-        BaseType_t created = pdFAIL;
-        if (configuration.Core >= 0) {
-            created = xTaskCreatePinnedToCore(
-                entry,
-                configuration.Name,
-                configuration.StackSize,
-                parameter,
-                configuration.Priority,
-                &result.Handle,
-                configuration.Core
-            );
-        } else {
-            created = xTaskCreate(
-                entry,
-                configuration.Name,
-                configuration.StackSize,
-                parameter,
-                configuration.Priority,
-                &result.Handle
-            );
-        }
+        System::Execution::ExecutionConfiguration nativeConfiguration;
+        nativeConfiguration.Name = configuration.Name;
+        nativeConfiguration.StackSizeBytes = configuration.StackSize;
+        nativeConfiguration.Priority = configuration.Priority;
+        nativeConfiguration.Affinity = configuration.Core >= 0
+            ? System::ProcessorAffinity::Specific(static_cast<uint8_t>(configuration.Core))
+            : System::ProcessorAffinity::Any();
 
-        result.Status =
-            created == pdPASS && result.Handle != nullptr
-                ? TaskExecutionStatus::Success
-                : TaskExecutionStatus::TaskCreationFailed;
+        const auto created = System::Execution::Provider().Create(
+            entry,
+            parameter,
+            nativeConfiguration
+        );
+        result.Status = MapCreationStatus(created.Result.Status);
+        result.Handle = created.Handle;
         return result;
     }
 
-    static void Delete(NativeTaskHandle handle) {
-        vTaskDelete(handle);
+    static void Delete(TaskHandle handle) {
+        (void)System::Execution::Provider().Destroy(handle);
     }
 
-    static void Suspend(NativeTaskHandle handle) {
-        vTaskSuspend(handle);
+    static void Suspend(TaskHandle handle) {
+        (void)System::Execution::Provider().Suspend(handle);
     }
 
-    static void Resume(NativeTaskHandle handle) {
-        vTaskResume(handle);
+    static void Resume(TaskHandle handle) {
+        (void)System::Execution::Provider().Resume(handle);
     }
 
-    static NativeTaskHandle Current() {
-        return xTaskGetCurrentTaskHandle();
+    static TaskHandle Current() {
+        return System::Execution::Provider().Current();
     }
 
-    static uint32_t MinimumFreeStack(NativeTaskHandle handle) {
-        return static_cast<uint32_t>(uxTaskGetStackHighWaterMark(handle));
+    static uint32_t MinimumFreeStack(TaskHandle handle) {
+        return System::Execution::Provider().MinimumFreeStackBytes(handle);
+    }
+
+    static void SleepMilliseconds(uint32_t milliseconds) {
+        System::Execution::Provider().SleepMilliseconds(milliseconds);
+    }
+
+    static void Yield() {
+        System::Execution::Provider().Yield();
     }
 };
 
