@@ -5,16 +5,30 @@ ESPressio Task provides bounded asynchronous execution primitives for the ESPres
 It is intentionally distinct from ESPressio Threads:
 
 - **Task** represents discrete asynchronous work.
-- **TaskExecutor** represents a persistent bounded worker used to execute many discrete work items without creating a FreeRTOS task per message.
+- **TaskExecutor** represents a persistent bounded worker used to execute many discrete work items without creating an execution context per message.
 - **Threads** remains the higher-level lifecycle abstraction for long-lived autonomous workers.
+
+## Platform independence
+
+ESPressio Task no longer depends directly on FreeRTOS or ESP32. Primitive execution, bounded queues and synchronization are supplied by ESPressio-System providers.
+
+On ESP32, the top-level application installs those providers through ESPressio-ESP32:
+
+```cpp
+#include <ESPressio_ESP32.hpp>
+
+ESPressio::ESP32Platform::InstallSystemProviders();
+```
+
+This keeps Task's lifecycle and asynchronous-work semantics reusable on future hardware/runtime implementations.
 
 ## Lifecycle
 
-Constructors never execute user work. `TaskExecutor::Initialize()` reserves the queue and worker resources, but the worker remains behind a start gate until `Start()` is called. This makes it safe to reserve stacks early during application setup without allowing work to escape before dependencies are ready.
+Constructors never execute user work. `TaskExecutor::Initialize()` reserves the queue and worker resources, but the worker remains behind a start gate until `Start()` is called. This makes it safe to reserve execution resources early during application setup without allowing work to escape before dependencies are ready.
 
 ## Typed bounded executors
 
-`TaskExecutor<TWorkItem>` requires a trivially-copyable work item. The FreeRTOS queue therefore stores the work item directly and deterministically rather than retaining heap-allocating callable captures on the hot path.
+`TaskExecutor<TWorkItem>` requires a trivially-copyable work item. The installed System queue provider stores fixed-size work items directly and deterministically rather than retaining heap-allocating callable captures on the hot path.
 
 ```cpp
 #include <ESPressio_Task.hpp>
@@ -45,18 +59,56 @@ void setup() {
 
 Available policies are `Reject`, `DropOldest`, `DropNewest`, and `Block`. Queues are always bounded; ESPressio Task never grows an unbounded pending-work collection.
 
+For the `Block` policy, the optional second argument to `Submit()` is now expressed in **milliseconds**, not native RTOS ticks:
+
+```cpp
+executor.Submit(item, 25); // block for up to 25 ms
+```
+
 ## Stack instrumentation
 
-`GetStatistics()` reports submitted/completed/rejected/dropped counts together with configured stack size and the worker's lifetime minimum-free stack high-water value.
+`GetStatistics()` reports submitted/completed/rejected/dropped counts together with configured stack size and the worker's lifetime minimum-free-stack value. The underlying platform measurement is provided through `System::Execution` rather than a native RTOS API.
 
 ## One-shot work
 
-`Task::Run()` is available for infrequent fire-and-forget work. High-frequency communications and protocol paths should prefer `TaskExecutor` to avoid repeated task/stack/TCB allocation.
+`Task::Run()` is available for infrequent fire-and-forget work. High-frequency communications and protocol paths should prefer `TaskExecutor` to avoid repeated execution-stack/control-block allocation.
+
+## Processor affinity
+
+`TaskConfiguration::Core` remains the developer-facing compatibility setting for this generation. A negative value requests any processor; a non-negative value is translated to `System::ProcessorAffinity::Specific(...)`.
+
+Whether a target can honour affinity is a platform capability. ESPressio-ESP32 does so through its FreeRTOS execution provider.
 
 ## Memory policy
 
-The initial backend exposes memory policy in `TaskConfiguration`. Internal task stacks are supported now. External-stack support is kept explicit in the API but returns `UnsupportedMemoryPolicy` until a backend implementation can guarantee safe cleanup/lifecycle semantics for the selected ESP-IDF target.
+`TaskConfiguration` continues to expose task memory policy. Internal execution stacks are supported by the current provider path. `External` remains explicit but returns `UnsupportedMemoryPolicy` until a provider contract exists that can guarantee safe external-stack lifecycle semantics across supported targets.
 
-## Current implementation
+## Architecture
 
-The initial implementation targets ESP32/FreeRTOS. The public concepts are kept separate enough that the backend can later move to a dedicated FreeRTOS implementation library without changing consumers.
+```text
+ESPressio-Task
+    |
+    +-- System::Execution
+    +-- System::Queue
+    +-- System::Synchronization
+             |
+             v
+       ESPressio-ESP32
+             |
+             v
+          FreeRTOS
+```
+
+Task consumers therefore do not include FreeRTOS headers or expose FreeRTOS handles.
+
+## Coordinated development dependency
+
+During this tranche, Task consumes:
+
+```ini
+https://github.com/ESPressio-Development-Platform/ESPressio-System.git#feature/1-system-memory-policy
+```
+
+The Lab application remains responsible for installing the concrete ESP32 providers.
+
+See `PLATFORM_ABSTRACTIONS.md` for the migration audit trail.
