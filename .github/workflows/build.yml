@@ -15,5 +15,9 @@ jobs:
           python-version: '3.x'
       - name: Install PlatformIO
         run: pip install platformio
-      - name: Compile example
-        run: pio ci examples/Basic/src/main.cpp --lib="." --board=esp32dev
+      - name: Compile Arduino ESP32 example
+        run: >-
+          pio ci examples/Basic/src/main.cpp
+          --lib="."
+          --board=esp32dev
+          --project-option="framework=arduino"
