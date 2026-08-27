@@ -5,9 +5,7 @@
 #include <new>
 #include <utility>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
+#include "ESPressio_TaskRuntime.hpp"
 #include "ESPressio_TaskTypes.hpp"
 
 namespace ESPressio {
@@ -29,7 +27,7 @@ class Task {
                 // Fire-and-forget isolation: callers observe submission only.
             }
         }
-        vTaskDelete(nullptr);
+        TaskRuntime::Delete(System::Execution::InvalidExecutionHandle);
     }
 
 public:
@@ -51,31 +49,13 @@ public:
             return TaskExecutionStatus::TaskCreationFailed;
         }
 
-        TaskHandle_t task = nullptr;
-        BaseType_t result = pdFAIL;
-        if (configuration.Core >= 0) {
-            result = xTaskCreatePinnedToCore(
-                _entry,
-                configuration.Name,
-                configuration.StackSize,
-                invocation.get(),
-                configuration.Priority,
-                &task,
-                configuration.Core
-            );
-        } else {
-            result = xTaskCreate(
-                _entry,
-                configuration.Name,
-                configuration.StackSize,
-                invocation.get(),
-                configuration.Priority,
-                &task
-            );
-        }
-
-        if (result != pdPASS || task == nullptr) {
-            return TaskExecutionStatus::TaskCreationFailed;
+        const auto created = TaskRuntime::Create(
+            _entry,
+            invocation.get(),
+            configuration
+        );
+        if (!created) {
+            return created.Status;
         }
 
         invocation.release();
