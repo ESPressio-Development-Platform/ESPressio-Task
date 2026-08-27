@@ -6,11 +6,10 @@
 #include <memory>
 #include <type_traits>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/queue.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
+#include <ESPressio_Queue.hpp>
+#include <ESPressio_Synchronization.hpp>
 
+#include "ESPressio_TaskRuntime.hpp"
 #include "ESPressio_TaskTypes.hpp"
 
 namespace ESPressio {
@@ -29,9 +28,9 @@ public:
 private:
     TaskConfiguration _configuration;
     Handler _handler;
-    QueueHandle_t _queue = nullptr;
-    SemaphoreHandle_t _startGate = nullptr;
-    TaskHandle_t _task = nullptr;
+    std::unique_ptr<System::Queue::IMessageQueue> _queue;
+    std::unique_ptr<System::Synchronization::ISignal> _startGate;
+    TaskHandle _task = System::Execution::InvalidExecutionHandle;
     std::atomic<bool> _initialized{false};
     std::atomic<bool> _started{false};
     std::atomic<bool> _stopping{false};
@@ -46,41 +45,30 @@ private:
         if (executor != nullptr) {
             executor->_run();
         }
-        vTaskDelete(nullptr);
+        TaskRuntime::Delete(System::Execution::InvalidExecutionHandle);
     }
 
     void _run() {
-        if (_startGate == nullptr) {
-            return;
-        }
+        if (_startGate == nullptr || _queue == nullptr) return;
 
-        xSemaphoreTake(_startGate, portMAX_DELAY);
-        if (_stopping.load(std::memory_order_acquire)) {
-            return;
-        }
+        if (!_startGate->Wait()) return;
+        if (_stopping.load(std::memory_order_acquire)) return;
 
         TWorkItem item{};
         while (!_stopping.load(std::memory_order_acquire)) {
-            if (xQueueReceive(_queue, &item, portMAX_DELAY) != pdTRUE) {
-                continue;
-            }
-
-            if (_stopping.load(std::memory_order_acquire)) {
-                break;
-            }
+            const auto received = _queue->Receive(&item);
+            if (!received) continue;
+            if (_stopping.load(std::memory_order_acquire)) break;
 
             try {
-                if (_handler) {
-                    _handler(item);
-                }
+                if (_handler) _handler(item);
             } catch (...) {
                 // Executor isolation: work-item failures must not kill the worker.
             }
 
             _completed.fetch_add(1, std::memory_order_relaxed);
-            const auto highWater = uxTaskGetStackHighWaterMark(nullptr);
             _minimumFreeStack.store(
-                static_cast<uint32_t>(highWater),
+                TaskRuntime::MinimumFreeStack(System::Execution::InvalidExecutionHandle),
                 std::memory_order_relaxed
             );
         }
@@ -90,19 +78,10 @@ public:
     TaskExecutor() = default;
 
     explicit TaskExecutor(TaskConfiguration configuration)
-        : _configuration(configuration) {
-    }
+        : _configuration(configuration) {}
 
     ~TaskExecutor() {
         Stop();
-        if (_queue != nullptr) {
-            vQueueDelete(_queue);
-            _queue = nullptr;
-        }
-        if (_startGate != nullptr) {
-            vSemaphoreDelete(_startGate);
-            _startGate = nullptr;
-        }
     }
 
     TaskExecutor(const TaskExecutor&) = delete;
@@ -124,53 +103,29 @@ public:
         }
 
         _handler = std::move(handler);
-        _queue = xQueueCreate(
-            static_cast<UBaseType_t>(_configuration.QueueDepth),
-            sizeof(TWorkItem)
-        );
+        _stopping.store(false, std::memory_order_release);
+
+        _queue = System::Queue::Create<TWorkItem>(_configuration.QueueDepth);
         if (_queue == nullptr) {
             return TaskExecutionStatus::QueueUnavailable;
         }
 
-        _startGate = xSemaphoreCreateBinary();
+        _startGate = System::Synchronization::CreateBinarySignal();
         if (_startGate == nullptr) {
-            vQueueDelete(_queue);
-            _queue = nullptr;
+            _queue.reset();
             return TaskExecutionStatus::QueueUnavailable;
         }
 
-        BaseType_t result = pdFAIL;
-        if (_configuration.Core >= 0) {
-            result = xTaskCreatePinnedToCore(
-                _entry,
-                _configuration.Name,
-                _configuration.StackSize,
-                this,
-                _configuration.Priority,
-                &_task,
-                _configuration.Core
-            );
-        } else {
-            result = xTaskCreate(
-                _entry,
-                _configuration.Name,
-                _configuration.StackSize,
-                this,
-                _configuration.Priority,
-                &_task
-            );
+        const auto created = TaskRuntime::Create(_entry, this, _configuration);
+        if (!created) {
+            _startGate.reset();
+            _queue.reset();
+            return created.Status;
         }
 
-        if (result != pdPASS || _task == nullptr) {
-            vSemaphoreDelete(_startGate);
-            _startGate = nullptr;
-            vQueueDelete(_queue);
-            _queue = nullptr;
-            return TaskExecutionStatus::TaskCreationFailed;
-        }
-
+        _task = created.Handle;
         _minimumFreeStack.store(
-            static_cast<uint32_t>(uxTaskGetStackHighWaterMark(_task)),
+            TaskRuntime::MinimumFreeStack(_task),
             std::memory_order_relaxed
         );
         _initialized.store(true, std::memory_order_release);
@@ -185,30 +140,33 @@ public:
         if (!_started.compare_exchange_strong(expected, true)) {
             return TaskExecutionStatus::AlreadyStarted;
         }
-        xSemaphoreGive(_startGate);
+        if (_startGate == nullptr || !_startGate->Give()) {
+            _started.store(false, std::memory_order_release);
+            return TaskExecutionStatus::QueueUnavailable;
+        }
         return TaskExecutionStatus::Success;
     }
 
     void Stop() {
-        if (!_initialized.load(std::memory_order_acquire)) {
-            return;
-        }
+        if (!_initialized.load(std::memory_order_acquire)) return;
 
         _stopping.store(true, std::memory_order_release);
-        if (_startGate != nullptr) {
-            xSemaphoreGive(_startGate);
+        if (_startGate != nullptr) (void)_startGate->Give();
+
+        if (_task != System::Execution::InvalidExecutionHandle) {
+            TaskRuntime::Delete(_task);
+            _task = System::Execution::InvalidExecutionHandle;
         }
-        if (_task != nullptr) {
-            vTaskDelete(_task);
-            _task = nullptr;
-        }
+
         _started.store(false, std::memory_order_release);
         _initialized.store(false, std::memory_order_release);
+        _startGate.reset();
+        _queue.reset();
     }
 
     TaskExecutionStatus Submit(
         const TWorkItem& item,
-        TickType_t blockTicks = 0
+        uint32_t blockMilliseconds = 0
     ) {
         if (!_initialized.load(std::memory_order_acquire)) {
             return TaskExecutionStatus::NotInitialized;
@@ -216,39 +174,45 @@ public:
         if (!_started.load(std::memory_order_acquire)) {
             return TaskExecutionStatus::NotStarted;
         }
+        if (_queue == nullptr) {
+            return TaskExecutionStatus::QueueUnavailable;
+        }
 
-        BaseType_t queued = pdFALSE;
+        System::PlatformResult queued = System::PlatformResult::Failed(
+            System::PlatformStatus::Busy
+        );
+
         switch (_configuration.OverflowPolicy) {
             case TaskQueueOverflowPolicy::Reject:
-                queued = xQueueSend(_queue, &item, 0);
+                queued = _queue->Send(&item, 0);
                 break;
 
             case TaskQueueOverflowPolicy::DropNewest:
-                queued = xQueueSend(_queue, &item, 0);
-                if (queued != pdTRUE) {
+                queued = _queue->Send(&item, 0);
+                if (!queued) {
                     _dropped.fetch_add(1, std::memory_order_relaxed);
                     return TaskExecutionStatus::QueueFull;
                 }
                 break;
 
             case TaskQueueOverflowPolicy::DropOldest: {
-                queued = xQueueSend(_queue, &item, 0);
-                if (queued != pdTRUE) {
+                queued = _queue->Send(&item, 0);
+                if (!queued) {
                     TWorkItem discarded{};
-                    if (xQueueReceive(_queue, &discarded, 0) == pdTRUE) {
+                    if (_queue->Receive(&discarded, 0)) {
                         _dropped.fetch_add(1, std::memory_order_relaxed);
                     }
-                    queued = xQueueSend(_queue, &item, 0);
+                    queued = _queue->Send(&item, 0);
                 }
                 break;
             }
 
             case TaskQueueOverflowPolicy::Block:
-                queued = xQueueSend(_queue, &item, blockTicks);
+                queued = _queue->Send(&item, blockMilliseconds);
                 break;
         }
 
-        if (queued != pdTRUE) {
+        if (!queued) {
             _rejected.fetch_add(1, std::memory_order_relaxed);
             return TaskExecutionStatus::QueueFull;
         }
