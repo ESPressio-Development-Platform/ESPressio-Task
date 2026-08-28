@@ -11,6 +11,7 @@
 namespace ESPressio {
 namespace Task {
 
+/// <summary>Runs fire-and-forget work on a newly created ESPressio task execution context.</summary>
 class Task {
     struct Invocation {
         std::function<void()> Work;
@@ -31,6 +32,10 @@ class Task {
     }
 
 public:
+    /// <summary>Submits one callable for execution on a dedicated one-shot task.</summary>
+    /// <param name="work">Callable executed by the newly created task.</param>
+    /// <param name="configuration">Execution configuration used for the one-shot task.</param>
+    /// <returns>The task-domain status describing whether the work was successfully submitted.</returns>
     static TaskExecutionStatus Run(
         std::function<void()> work,
         TaskConfiguration configuration = {}

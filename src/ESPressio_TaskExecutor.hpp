@@ -15,6 +15,8 @@
 namespace ESPressio {
 namespace Task {
 
+/// <summary>Executes trivially copyable work items on a dedicated queued worker task.</summary>
+/// <typeparam name="TWorkItem">Trivially copyable work-item type stored in the bounded queue.</typeparam>
 template <typename TWorkItem>
 class TaskExecutor {
     static_assert(
@@ -23,6 +25,7 @@ class TaskExecutor {
     );
 
 public:
+    /// <summary>Callable invoked by the worker for each dequeued work item.</summary>
     using Handler = std::function<void(const TWorkItem&)>;
 
 private:
@@ -75,11 +78,14 @@ private:
     }
 
 public:
+    /// <summary>Creates an executor using the default task configuration.</summary>
     TaskExecutor() = default;
 
+    /// <summary>Creates an executor using the supplied task configuration.</summary>
     explicit TaskExecutor(TaskConfiguration configuration)
         : _configuration(configuration) {}
 
+    /// <summary>Stops the worker and releases its runtime resources.</summary>
     ~TaskExecutor() {
         Stop();
     }
@@ -87,10 +93,14 @@ public:
     TaskExecutor(const TaskExecutor&) = delete;
     TaskExecutor& operator=(const TaskExecutor&) = delete;
 
+    /// <summary>Gets the configuration used to initialize and run this executor.</summary>
     const TaskConfiguration& GetConfiguration() const {
         return _configuration;
     }
 
+    /// <summary>Creates the queue and worker task and installs the work-item handler.</summary>
+    /// <param name="handler">Handler invoked for each dequeued work item.</param>
+    /// <returns>The initialization status.</returns>
     TaskExecutionStatus Initialize(Handler handler) {
         if (_initialized.load(std::memory_order_acquire)) {
             return TaskExecutionStatus::AlreadyInitialized;
@@ -132,6 +142,8 @@ public:
         return TaskExecutionStatus::Success;
     }
 
+    /// <summary>Releases the initialized worker to begin consuming queued work.</summary>
+    /// <returns>The start status.</returns>
     TaskExecutionStatus Start() {
         if (!_initialized.load(std::memory_order_acquire)) {
             return TaskExecutionStatus::NotInitialized;
@@ -147,6 +159,7 @@ public:
         return TaskExecutionStatus::Success;
     }
 
+    /// <summary>Stops the worker and releases queue and synchronization resources.</summary>
     void Stop() {
         if (!_initialized.load(std::memory_order_acquire)) return;
 
@@ -164,6 +177,10 @@ public:
         _queue.reset();
     }
 
+    /// <summary>Submits a work item according to the configured queue-overflow policy.</summary>
+    /// <param name="item">Work item copied into the executor queue.</param>
+    /// <param name="blockMilliseconds">Maximum queue wait used by the blocking overflow policy.</param>
+    /// <returns>The work-submission status.</returns>
     TaskExecutionStatus Submit(
         const TWorkItem& item,
         uint32_t blockMilliseconds = 0
@@ -221,6 +238,7 @@ public:
         return TaskExecutionStatus::Success;
     }
 
+    /// <summary>Gets a snapshot of cumulative work and stack diagnostics.</summary>
     TaskExecutionStatistics GetStatistics() const {
         TaskExecutionStatistics statistics;
         statistics.Submitted = _submitted.load(std::memory_order_relaxed);
