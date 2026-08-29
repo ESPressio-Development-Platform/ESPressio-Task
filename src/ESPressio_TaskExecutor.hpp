@@ -6,6 +6,7 @@
 #include <memory>
 #include <type_traits>
 
+#include <ESPressio_Memory.hpp>
 #include <ESPressio_Queue.hpp>
 #include <ESPressio_Synchronization.hpp>
 
@@ -42,6 +43,20 @@ private:
     std::atomic<uint64_t> _rejected{0};
     std::atomic<uint64_t> _dropped{0};
     std::atomic<uint32_t> _minimumFreeStack{0};
+
+    static System::Memory::MemoryPolicy QueueMemoryPolicy(
+        TaskMemoryPolicy policy
+    ) noexcept {
+        switch (policy) {
+            case TaskMemoryPolicy::PreferExternal:
+                return System::Memory::MemoryPolicy::ExternalPreferred;
+            case TaskMemoryPolicy::External:
+                return System::Memory::MemoryPolicy::ExternalRequired;
+            case TaskMemoryPolicy::Internal:
+            default:
+                return System::Memory::MemoryPolicy::Internal;
+        }
+    }
 
     static void _entry(void* parameter) {
         auto* executor = static_cast<TaskExecutor*>(parameter);
@@ -101,6 +116,13 @@ public:
     /// <summary>Creates the queue and worker task and installs the work-item handler.</summary>
     /// <param name="handler">Handler invoked for each dequeued work item.</param>
     /// <returns>The initialization status.</returns>
+    /// <remarks>
+    /// <c>PreferExternal</c> keeps the execution stack on the platform-safe task path while requesting
+    /// externally preferred queue backing through ESPressio System. Platforms that cannot provide an
+    /// external-preferred queue transparently fall back to normal/internal queue creation. A strict
+    /// <c>External</c> task policy remains unsupported until the execution provider can guarantee that
+    /// both task-stack and ancillary runtime requirements are safe in external memory.
+    /// </remarks>
     TaskExecutionStatus Initialize(Handler handler) {
         if (_initialized.load(std::memory_order_acquire)) {
             return TaskExecutionStatus::AlreadyInitialized;
@@ -115,7 +137,23 @@ public:
         _handler = std::move(handler);
         _stopping.store(false, std::memory_order_release);
 
-        _queue = System::Queue::Create<TWorkItem>(_configuration.QueueDepth);
+        const auto queuePolicy = QueueMemoryPolicy(_configuration.MemoryPolicy);
+        _queue = System::Queue::Create<TWorkItem>(
+            _configuration.QueueDepth,
+            queuePolicy
+        );
+        if (
+            _queue == nullptr &&
+            _configuration.MemoryPolicy == TaskMemoryPolicy::PreferExternal
+        ) {
+            // PreferExternal is a preference rather than a requirement. Keep
+            // portable providers working even when they predate policy-aware
+            // queues, while ESP32 can satisfy this path directly in PSRAM.
+            _queue = System::Queue::Create<TWorkItem>(
+                _configuration.QueueDepth,
+                System::Memory::MemoryPolicy::Internal
+            );
+        }
         if (_queue == nullptr) {
             return TaskExecutionStatus::QueueUnavailable;
         }
