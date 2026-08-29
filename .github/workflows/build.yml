@@ -15,14 +15,17 @@ jobs:
           python-version: '3.x'
       - name: Install PlatformIO
         run: pip install platformio
-      - name: Compile Arduino ESP32 example
+      - name: Compile Arduino ESP32 example against current platform
         shell: bash
         run: |
           set -o pipefail
           pio ci examples/Basic/src/main.cpp \
             --lib="." \
             --board=esp32dev \
+            --project-option="platform=https://github.com/pioarduino/platform-espressif32/releases/download/55.03.311/platform-espressif32.zip" \
             --project-option="framework=arduino" \
+            --project-option="build_flags=-std=gnu++17" \
+            --project-option="build_unflags=-std=gnu++11" \
             2>&1 | tee task-build.log
       - name: Upload compiler log
         if: always()
