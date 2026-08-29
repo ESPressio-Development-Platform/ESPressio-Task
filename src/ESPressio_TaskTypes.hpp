@@ -50,7 +50,12 @@ struct TaskConfiguration {
     /// <summary>Behaviour applied when the executor queue has no free capacity.</summary>
     TaskQueueOverflowPolicy OverflowPolicy = TaskQueueOverflowPolicy::Reject;
     /// <summary>Memory-placement policy requested for task runtime resources.</summary>
-    TaskMemoryPolicy MemoryPolicy = TaskMemoryPolicy::Internal;
+    /// <remarks>
+    /// The default prefers external memory for allocator-capable ancillary resources such as executor queue backing.
+    /// Task stacks remain on the platform-safe execution path unless a platform explicitly implements a safe external
+    /// stack policy; the current ESP32 implementation therefore keeps FreeRTOS stacks internal.
+    /// </remarks>
+    TaskMemoryPolicy MemoryPolicy = TaskMemoryPolicy::PreferExternal;
 };
 
 /// <summary>Captures cumulative executor activity and stack headroom diagnostics.</summary>
