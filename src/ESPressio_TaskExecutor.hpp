@@ -28,10 +28,14 @@ class TaskExecutor {
 public:
     /// <summary>Callable invoked by the worker for each dequeued work item.</summary>
     using Handler = std::function<void(const TWorkItem&)>;
+    /// <summary>Optional callback invoked when a previously accepted item is evicted by the <c>DropOldest</c> overflow policy.</summary>
+    /// <remarks>This is useful for pointer/handle work items whose externally owned payload must be reclaimed when the queue discards an item without executing it.</remarks>
+    using DiscardedHandler = std::function<void(const TWorkItem&)>;
 
 private:
     TaskConfiguration _configuration;
     Handler _handler;
+    DiscardedHandler _discardedHandler;
     std::unique_ptr<System::Queue::IMessageQueue> _queue;
     std::unique_ptr<System::Synchronization::ISignal> _startGate;
     TaskHandle _task = System::Execution::InvalidExecutionHandle;
@@ -115,6 +119,7 @@ public:
 
     /// <summary>Creates the queue and worker task and installs the work-item handler.</summary>
     /// <param name="handler">Handler invoked for each dequeued work item.</param>
+    /// <param name="discardedHandler">Optional callback invoked only for an already accepted item evicted by <c>DropOldest</c>.</param>
     /// <returns>The initialization status.</returns>
     /// <remarks>
     /// <c>PreferExternal</c> keeps the execution stack on the platform-safe task path while requesting
@@ -122,8 +127,13 @@ public:
     /// external-preferred queue transparently fall back to normal/internal queue creation. A strict
     /// <c>External</c> task policy remains unsupported until the execution provider can guarantee that
     /// both task-stack and ancillary runtime requirements are safe in external memory.
+    /// The discarded-item callback enables pointer/handle work-item patterns to reclaim their separately
+    /// owned payload when <c>DropOldest</c> removes an item without executing it.
     /// </remarks>
-    TaskExecutionStatus Initialize(Handler handler) {
+    TaskExecutionStatus Initialize(
+        Handler handler,
+        DiscardedHandler discardedHandler = {}
+    ) {
         if (_initialized.load(std::memory_order_acquire)) {
             return TaskExecutionStatus::AlreadyInitialized;
         }
@@ -135,6 +145,7 @@ public:
         }
 
         _handler = std::move(handler);
+        _discardedHandler = std::move(discardedHandler);
         _stopping.store(false, std::memory_order_release);
 
         const auto queuePolicy = QueueMemoryPolicy(_configuration.MemoryPolicy);
@@ -213,6 +224,8 @@ public:
         _initialized.store(false, std::memory_order_release);
         _startGate.reset();
         _queue.reset();
+        _discardedHandler = {};
+        _handler = {};
     }
 
     /// <summary>Submits a work item according to the configured queue-overflow policy.</summary>
@@ -256,6 +269,15 @@ public:
                     TWorkItem discarded{};
                     if (_queue->Receive(&discarded, 0)) {
                         _dropped.fetch_add(1, std::memory_order_relaxed);
+                        if (_discardedHandler) {
+                            try {
+                                _discardedHandler(discarded);
+                            } catch (...) {
+                                // Reclamation callbacks are isolated exactly
+                                // like work-item handlers; overflow handling
+                                // must not kill the submitting thread.
+                            }
+                        }
                     }
                     queued = _queue->Send(&item, 0);
                 }
