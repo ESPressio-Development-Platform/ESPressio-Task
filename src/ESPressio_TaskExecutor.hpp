@@ -29,8 +29,8 @@ class TaskExecutor {
 public:
     /// <summary>Callable invoked by the worker for each dequeued work item.</summary>
     using Handler = std::function<void(const TWorkItem&)>;
-    /// <summary>Optional callback invoked when a previously accepted item is evicted by the <c>DropOldest</c> overflow policy.</summary>
-    /// <remarks>This is useful for pointer/handle work items whose externally owned payload must be reclaimed when the queue discards an item without executing it.</remarks>
+    /// <summary>Optional callback invoked when an accepted item is discarded without execution.</summary>
+    /// <remarks>This includes DropOldest eviction and queued work reclaimed during executor shutdown.</remarks>
     using DiscardedHandler = std::function<void(const TWorkItem&)>;
 
 private:
@@ -100,6 +100,15 @@ private:
         }
     }
 
+    void DiscardItem(const TWorkItem& item) noexcept {
+        if (!_discardedHandler) return;
+        try {
+            _discardedHandler(item);
+        } catch (...) {
+            // Reclamation callbacks are isolated exactly like work handlers.
+        }
+    }
+
     class SubmissionGuard final {
     private:
         TaskExecutor& _owner;
@@ -135,7 +144,7 @@ public:
 
     /// <summary>Creates the queue and worker task and installs the work-item handler.</summary>
     /// <param name="handler">Handler invoked for each dequeued work item.</param>
-    /// <param name="discardedHandler">Optional callback invoked only for an already accepted item evicted by <c>DropOldest</c>.</param>
+    /// <param name="discardedHandler">Optional callback invoked for accepted work discarded without execution.</param>
     /// <returns>The initialization status.</returns>
     /// <remarks>
     /// <c>PreferExternal</c> keeps the execution stack on the platform-safe task path while requesting
@@ -144,7 +153,7 @@ public:
     /// <c>External</c> task policy remains unsupported until the execution provider can guarantee that
     /// both task-stack and ancillary runtime requirements are safe in external memory.
     /// The discarded-item callback enables pointer/handle work-item patterns to reclaim their separately
-    /// owned payload when <c>DropOldest</c> removes an item without executing it.
+    /// owned payload both on queue eviction and when queued items are abandoned during shutdown.
     /// Lifecycle publication and teardown are serialized so Submit/Start cannot observe queue or signal
     /// resources while they are being replaced or released.
     /// </remarks>
@@ -180,9 +189,6 @@ public:
             _queue == nullptr &&
             _configuration.MemoryPolicy == TaskMemoryPolicy::PreferExternal
         ) {
-            // PreferExternal is a preference rather than a requirement. Keep
-            // portable providers working even when they predate policy-aware
-            // queues, while ESP32 can satisfy this path directly in PSRAM.
             _queue = System::Queue::Create<TWorkItem>(
                 _configuration.QueueDepth,
                 System::Memory::MemoryPolicy::Internal
@@ -241,8 +247,8 @@ public:
         return TaskExecutionStatus::Success;
     }
 
-    /// <summary>Stops the worker and releases queue and synchronization resources.</summary>
-    /// <remarks>New submissions are rejected first. Already admitted submissions are allowed to leave the queue operation while the worker is still alive, preventing teardown from invalidating queue storage beneath a concurrent producer.</remarks>
+    /// <summary>Stops the worker, reclaims queued work, and releases runtime resources.</summary>
+    /// <remarks>New submissions are rejected first. Already admitted submissions leave their queue operation before teardown. Any accepted item still queued after the worker stops is passed to the discarded-item callback before queue storage is released.</remarks>
     void Stop() {
         bool waitForOtherStop = false;
         {
@@ -251,9 +257,6 @@ public:
             if (_stopInProgress.exchange(true, std::memory_order_acq_rel)) {
                 waitForOtherStop = true;
             } else {
-                // Closing the submission gate before setting _stopping lets any
-                // already-admitted blocking producer finish while the worker can
-                // still drain queue capacity.
                 _started.store(false, std::memory_order_release);
             }
         }
@@ -284,6 +287,13 @@ public:
 
         {
             std::lock_guard<System::Synchronization::Mutex> lifecycle(_lifecycleMutex);
+            if (_queue != nullptr) {
+                TWorkItem discarded{};
+                while (_queue->Receive(&discarded, 0)) {
+                    _dropped.fetch_add(1, std::memory_order_relaxed);
+                    DiscardItem(discarded);
+                }
+            }
             _startGate.reset();
             _queue.reset();
             _discardedHandler = {};
@@ -345,15 +355,7 @@ public:
                     TWorkItem discarded{};
                     if (queue->Receive(&discarded, 0)) {
                         _dropped.fetch_add(1, std::memory_order_relaxed);
-                        if (_discardedHandler) {
-                            try {
-                                _discardedHandler(discarded);
-                            } catch (...) {
-                                // Reclamation callbacks are isolated exactly
-                                // like work-item handlers; overflow handling
-                                // must not kill the submitting thread.
-                            }
-                        }
+                        DiscardItem(discarded);
                     }
                     queued = queue->Send(&item, 0);
                 }
