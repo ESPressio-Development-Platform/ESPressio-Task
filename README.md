@@ -106,7 +106,7 @@ Task consumers therefore do not include FreeRTOS headers or expose FreeRTOS hand
 During this tranche, Task consumes:
 
 ```ini
-https://github.com/ESPressio-Development-Platform/ESPressio-System.git#feature/1-system-memory-policy
+https://github.com/ESPressio-Development-Platform/ESPressio-System.git#main
 ```
 
 The Lab application remains responsible for installing the concrete ESP32 providers.
