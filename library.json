@@ -1,0 +1,28 @@
+{
+  "name": "ESPressio-Task",
+  "description": "Bounded asynchronous task execution primitives for the ESPressio Development Platform",
+  "keywords": "espressio,task,async,executor,queue,platform-neutral",
+  "homepage": "https://espressio.org",
+  "authors": {
+    "name": "Simon J. Stuart",
+    "maintainer": true,
+    "url": "https://espressio.org"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ESPressio-Development-Platform/ESPressio-Task.git"
+  },
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "frameworks": "*",
+  "platforms": "*",
+  "build": {
+    "flags": ["-std=gnu++17", "-DESPRESSIO_TASK"]
+  },
+  "dependencies": [
+    {
+      "name": "ESPressio-System",
+      "version": "https://github.com/ESPressio-Development-Platform/ESPressio-System.git#feature/1-system-memory-policy"
+    }
+  ]
+}
