@@ -7,6 +7,13 @@ namespace ESPressio {
 namespace Task {
 
 /// <summary>Specifies how a task executor behaves when its work queue is full.</summary>
+/**
+ * ESPressio Memory Audit
+ * Underlying storage: 1 bytes
+ * Total Memory: 1 bytes [0 bytes dynamic allocation]
+ * Basis: ESP32/Xtensa ILP32 reference ABI (4-byte pointers/size_t); ESPressio stateful allocators/deleters included; ABI-sensitive STL/platform internals are identified explicitly.
+ * End ESPressio Memory Audit
+ */
 enum class TaskQueueOverflowPolicy : uint8_t {
     Reject,
     DropOldest,
@@ -15,6 +22,13 @@ enum class TaskQueueOverflowPolicy : uint8_t {
 };
 
 /// <summary>Specifies the memory-placement policy requested for a task's runtime resources.</summary>
+/**
+ * ESPressio Memory Audit
+ * Underlying storage: 1 bytes
+ * Total Memory: 1 bytes [0 bytes dynamic allocation]
+ * Basis: ESP32/Xtensa ILP32 reference ABI (4-byte pointers/size_t); ESPressio stateful allocators/deleters included; ABI-sensitive STL/platform internals are identified explicitly.
+ * End ESPressio Memory Audit
+ */
 enum class TaskMemoryPolicy : uint8_t {
     Internal,
     External,
@@ -22,6 +36,13 @@ enum class TaskMemoryPolicy : uint8_t {
 };
 
 /// <summary>Identifies the outcome of task creation, lifecycle, or work-submission operations.</summary>
+/**
+ * ESPressio Memory Audit
+ * Underlying storage: 1 bytes
+ * Total Memory: 1 bytes [0 bytes dynamic allocation]
+ * Basis: ESP32/Xtensa ILP32 reference ABI (4-byte pointers/size_t); ESPressio stateful allocators/deleters included; ABI-sensitive STL/platform internals are identified explicitly.
+ * End ESPressio Memory Audit
+ */
 enum class TaskExecutionStatus : uint8_t {
     Success,
     NotInitialized,
@@ -36,6 +57,20 @@ enum class TaskExecutionStatus : uint8_t {
 };
 
 /// <summary>Configures execution, queueing, affinity, and memory policy for an ESPressio task.</summary>
+/**
+ * ESPressio Memory Audit
+ * Members:
+ * - Name (char*): 4 bytes [0 bytes dynamic allocation]
+ * - StackSize (uint32_t): 4 bytes [0 bytes dynamic allocation]
+ * - Priority (uint32_t): 4 bytes [0 bytes dynamic allocation]
+ * - Core (int32_t): 4 bytes [0 bytes dynamic allocation]
+ * - QueueDepth (size_t): 4 bytes [0 bytes dynamic allocation]
+ * - OverflowPolicy (TaskQueueOverflowPolicy): 1 bytes [0 bytes dynamic allocation]
+ * - MemoryPolicy (TaskMemoryPolicy): 1 bytes [0 bytes dynamic allocation]
+ * Total Memory: 24 bytes [0 bytes dynamic allocation]
+ * Basis: ESP32/Xtensa ILP32 reference ABI (4-byte pointers/size_t); ESPressio stateful allocators/deleters included; ABI-sensitive STL/platform internals are identified explicitly.
+ * End ESPressio Memory Audit
+ */
 struct TaskConfiguration {
     /// <summary>Diagnostic name assigned to the underlying execution context.</summary>
     const char* Name = "espressioTask";
@@ -59,6 +94,19 @@ struct TaskConfiguration {
 };
 
 /// <summary>Captures cumulative executor activity and stack headroom diagnostics.</summary>
+/**
+ * ESPressio Memory Audit
+ * Members:
+ * - Submitted (uint64_t): 8 bytes [0 bytes dynamic allocation]
+ * - Completed (uint64_t): 8 bytes [0 bytes dynamic allocation]
+ * - Rejected (uint64_t): 8 bytes [0 bytes dynamic allocation]
+ * - Dropped (uint64_t): 8 bytes [0 bytes dynamic allocation]
+ * - ConfiguredStackSize (uint32_t): 4 bytes [0 bytes dynamic allocation]
+ * - MinimumFreeStack (uint32_t): 4 bytes [0 bytes dynamic allocation]
+ * Total Memory: 40 bytes [0 bytes dynamic allocation]
+ * Basis: ESP32/Xtensa ILP32 reference ABI (4-byte pointers/size_t); ESPressio stateful allocators/deleters included; ABI-sensitive STL/platform internals are identified explicitly.
+ * End ESPressio Memory Audit
+ */
 struct TaskExecutionStatistics {
     /// <summary>Total number of work items accepted for execution.</summary>
     uint64_t Submitted = 0;
