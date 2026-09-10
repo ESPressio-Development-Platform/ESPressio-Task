@@ -110,5 +110,3 @@ https://github.com/ESPressio-Development-Platform/ESPressio-System.git#main
 ```
 
 The Lab application remains responsible for installing the concrete ESP32 providers.
-
-See `PLATFORM_ABSTRACTIONS.md` for the migration audit trail.
