@@ -19,31 +19,7 @@ namespace Task {
 
 /// <summary>Executes trivially copyable work items on a dedicated queued worker task.</summary>
 /// <typeparam name="TWorkItem">Trivially copyable work-item type stored in the bounded queue.</typeparam>
-/**
- * ESPressio Memory Audit
- * Members:
- * - _configuration (TaskConfiguration): 24 bytes [0 bytes dynamic allocation]
- * - _handler (Handler): 56 bytes [Name: Capacity + 1 bytes when capacity exceeds 15-byte SSO; LastId: Capacity + 1 bytes when capacity exceeds 15-byte SSO]
- * - _discardedHandler (DiscardedHandler): 4 bytes [0 bytes dynamic allocation]
- * - _queue (std::unique_ptr<System::Queue::IMessageQueue>): 4 bytes [owned object: 4 bytes]
- * - _startGate (std::unique_ptr<System::Synchronization::ISignal>): 4 bytes [owned object: 4 bytes]
- * - _task (TaskHandle): 4 bytes [0 bytes dynamic allocation]
- * - _lifecycleMutex (System::Synchronization::Mutex): 20 bytes [_owned: owned object: 4 bytes; _fallback: _mutex: native synchronization state may allocate platform resources lazily]
- * - _initialized (std::atomic<bool>): 1 bytes [0 bytes dynamic allocation]
- * - _started (std::atomic<bool>): 1 bytes [0 bytes dynamic allocation]
- * - _stopping (std::atomic<bool>): 1 bytes [0 bytes dynamic allocation]
- * - _stopInProgress (std::atomic<bool>): 1 bytes [0 bytes dynamic allocation]
- * - _activeSubmissions (std::atomic<uint32_t>): 4 bytes [0 bytes dynamic allocation]
- * - _submitted (std::atomic<uint64_t>): 8 bytes [0 bytes dynamic allocation]
- * - _completed (std::atomic<uint64_t>): 8 bytes [0 bytes dynamic allocation]
- * - _rejected (std::atomic<uint64_t>): 8 bytes [0 bytes dynamic allocation]
- * - _dropped (std::atomic<uint64_t>): 8 bytes [0 bytes dynamic allocation]
- * - _minimumFreeStack (std::atomic<uint32_t>): 4 bytes [0 bytes dynamic allocation]
- * Total Memory: 160 bytes [_handler: Name: Capacity + 1 bytes when capacity exceeds 15-byte SSO; _handler: LastId: Capacity + 1 bytes when capacity exceeds 15-byte SSO; _queue: owned object: 4 bytes; _startGate: owned object: 4 bytes; _lifecycleMutex: _owned: owned object: 4 bytes; _lifecycleMutex: _fallback: _mutex: native synchronization state may allocate platform resources lazily]
- * Basis: ESP32/Xtensa ILP32 reference ABI (4-byte pointers/size_t); ESPressio stateful allocators/deleters included; ABI-sensitive STL/platform internals are identified explicitly.
- * Confidence: medium; compile-time sizeof on the concrete target remains authoritative for ABI-sensitive/opaque members.
- * End ESPressio Memory Audit
- */
+
 template <typename TWorkItem>
 class TaskExecutor {
     static_assert(
@@ -134,14 +110,7 @@ private:
         }
     }
 
-/**
- * ESPressio Memory Audit
- * Members:
- * - _owner (TaskExecutor&): 4 bytes [0 bytes dynamic allocation]
- * Total Memory: 4 bytes [0 bytes dynamic allocation]
- * Basis: ESP32/Xtensa ILP32 reference ABI (4-byte pointers/size_t); ESPressio stateful allocators/deleters included; ABI-sensitive STL/platform internals are identified explicitly.
- * End ESPressio Memory Audit
- */
+
 class SubmissionGuard final {
     private:
         TaskExecutor& _owner;

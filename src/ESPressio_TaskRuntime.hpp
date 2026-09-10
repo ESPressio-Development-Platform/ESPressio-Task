@@ -16,15 +16,7 @@ using TaskHandle = System::Execution::ExecutionHandle;
 using TaskEntry = System::Execution::ExecutionEntry;
 
 /// <summary>Contains the outcome and handle returned when a task execution context is created.</summary>
-/**
- * ESPressio Memory Audit
- * Members:
- * - Status (TaskExecutionStatus): 1 bytes [0 bytes dynamic allocation]
- * - Handle (TaskHandle): 4 bytes [0 bytes dynamic allocation]
- * Total Memory: 8 bytes [0 bytes dynamic allocation]
- * Basis: ESP32/Xtensa ILP32 reference ABI (4-byte pointers/size_t); ESPressio stateful allocators/deleters included; ABI-sensitive STL/platform internals are identified explicitly.
- * End ESPressio Memory Audit
- */
+
 struct TaskCreationResult {
     /// <summary>The task-domain creation status.</summary>
     TaskExecutionStatus Status = TaskExecutionStatus::TaskCreationFailed;
@@ -39,13 +31,7 @@ struct TaskCreationResult {
 };
 
 /// <summary>Adapts ESPressio task operations onto the active System execution provider.</summary>
-/**
- * ESPressio Memory Audit
- * Members: none (standalone empty object occupies 1 byte; an eligible empty base may be optimized to 0 bytes).
- * Total Memory: 1 bytes [0 bytes dynamic allocation]
- * Basis: ESP32/Xtensa ILP32 reference ABI (4-byte pointers/size_t); ESPressio stateful allocators/deleters included; ABI-sensitive STL/platform internals are identified explicitly.
- * End ESPressio Memory Audit
- */
+
 class TaskRuntime {
 private:
     static TaskExecutionStatus MapCreationStatus(System::PlatformStatus status) noexcept {

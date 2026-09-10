@@ -1,14 +1,7 @@
 #include <Arduino.h>
 #include <ESPressio_Task.hpp>
 
-/**
- * ESPressio Memory Audit
- * Members:
- * - Sequence (uint32_t): 4 bytes [0 bytes dynamic allocation]
- * Total Memory: 4 bytes [0 bytes dynamic allocation]
- * Basis: ESP32/Xtensa ILP32 reference ABI (4-byte pointers/size_t); ESPressio stateful allocators/deleters included; ABI-sensitive STL/platform internals are identified explicitly.
- * End ESPressio Memory Audit
- */
+
 struct WorkItem {
     uint32_t Sequence;
 };
