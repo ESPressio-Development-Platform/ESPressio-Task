@@ -23,7 +23,7 @@ class HostRuntime final : public ESPressio::System::Execution::IExecutionProvide
     inline static thread_local Handle _current=0;
 public:
     std::atomic<unsigned> Created{0},Joined{0},Signals{0},Waits{0};
-    bool FailSignal=false,FailExecution=false;
+    bool FailSignal=false,FailExecution=false,RequireEntryWaitBeforeCreateReturns=false;
     std::atomic<std::uint32_t> FreeStack{1024};
     class Signal final : public ESPressio::System::Synchronization::ISignal {
         HostRuntime& _runtime;
@@ -61,7 +61,15 @@ public:
         if (FailExecution) return {Result::Failed(Status::Unavailable),0};
         for (std::size_t i=0;i<_contexts.size();++i) if (!_contexts[i].Used) {
             auto& c=_contexts[i]; c.Used=true; ++Created;
+            const auto waitsBefore=Waits.load();
             c.Thread=std::thread([=]{_current=i+1; Gate(); entry(context); _current=0;});
+            if (RequireEntryWaitBeforeCreateReturns) {
+                const auto limit=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+                while (Waits.load()==waitsBefore) {
+                    assert(std::chrono::steady_clock::now()<limit);
+                    std::this_thread::yield();
+                }
+            }
             return {Result::Succeeded(),i+1};
         }
         return {Result::Failed(Status::Unavailable),0};

@@ -133,4 +133,14 @@ int main() {
     assert(racing.WorkerInstance.Shutdown()==TaskExecutionStatus::Success);
     denyHeap=false;
 
+    // Force entry before CreateJoinable returns. The worker must use its startup
+    // latch, not block on Initialize's admission lock and later race first work.
+    runtime.RequireEntryWaitBeforeCreateReturns=true;
+    Owner early;
+    assert((early.WorkerInstance.Initialize<Owner,&Owner::Execute,&Owner::Refill>(early)==TaskExecutionStatus::Success));
+    Lease firstAfterPublication(early.Releases,77);
+    assert(early.WorkerInstance.TryAssign(std::move(firstAfterPublication)));
+    Until([&]{return early.Refills==1;});
+    assert(early.WorkerInstance.Shutdown()==TaskExecutionStatus::Success);
+
 }

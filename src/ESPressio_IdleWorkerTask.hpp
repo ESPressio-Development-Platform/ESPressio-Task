@@ -48,6 +48,12 @@ template<class TWorkItem> class IdleWorkerTask final {
     TWorkItem& Item() noexcept { return *std::launder(reinterpret_cast<TWorkItem*>(_slot)); }
     static void Entry(void* context) { static_cast<IdleWorkerTask*>(context)->Run(); }
     void Run() noexcept {
+        // Creation may enter this context before Initialize publishes Idle.
+        // Wait on the same latch rather than entering the admission mutex with
+        // an obsolete Uninitialized observation. Once Idle is visible, this
+        // startup path never contends with the first source assignment.
+        while (_state.load(std::memory_order_acquire)==State::Uninitialized)
+            (void)_wake->Wait();
         for (;;) {
             // Idle inspection never holds the admission lock. This also prevents
             // a refill attempt from losing progress to a diagnostic/idle read.
@@ -123,6 +129,7 @@ public:
         _statistics.Reset(); _statistics.ConfiguredStackSize=configuration.StackSize;
         _statistics.MinimumFreeStack=_provider->MinimumFreeStackBytes(_task);
         _stopping=false; _joining=false; _released=0; _state=State::Idle;
+        (void)_wake->Give(); // Releases an entry that ran before publication.
         return TaskExecutionStatus::Success;
     }
     /// <summary>Attempts one admission without waiting for a lock or consuming a rejected source.</summary>

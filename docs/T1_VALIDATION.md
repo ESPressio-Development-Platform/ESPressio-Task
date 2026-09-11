@@ -59,3 +59,7 @@ consumers of TaskConfiguration/capturing TaskExecutor handlers are migrated in
 their dependency-ordered tranches. No alias is retained to conceal those breaks.
 One-shot Task::Run remains an explicitly dynamic convenience, not a core hot path.
 No version numbers, tags, releases or main integration were changed.
+
+## Early provider entry regression
+
+Event integration exposed the case where CreateJoinable enters the worker before Initialize publishes Idle. The entry now waits on the existing binary signal during that publication gap; it does not enter the admission mutex with an obsolete Uninitialized observation. The test provider can require the entry to have reached Wait before CreateJoinable returns, making the ordering deterministic. First assignment then succeeds immediately. All four Task gates pass with this regression. No slot, queue, signal or public API was added.
