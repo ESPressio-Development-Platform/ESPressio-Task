@@ -59,7 +59,7 @@ public:
     /// </remarks>
     static TaskExecutionStatus Run(
         std::function<void()> work,
-        TaskConfiguration configuration = {}
+        TaskExecutionConfiguration configuration = {}
     ) {
         if (!work || configuration.StackSize == 0) {
             return TaskExecutionStatus::InvalidConfiguration;

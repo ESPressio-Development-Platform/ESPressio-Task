@@ -1,112 +1,160 @@
 # ESPressio Task
 
-ESPressio Task provides bounded asynchronous execution primitives for the ESPressio Development Platform.
+Task owns discrete work execution below Threads. `IdleWorkerTask<T>` owns one
+pre-created joinable physical context, one binary wake signal and one inline
+nothrow-movable descriptor. It has no queue, application lifecycle or dependency
+on Threads. `TaskExecutor<T, MaximumPending>` adds one explicit fixed FIFO and
+reuses that worker. System provides execution, synchronization and monotonic time.
 
-It is intentionally distinct from ESPressio Threads:
+Install concrete System providers before initialization and keep them installed
+and alive until shutdown. In particular, a worker requires `CreateJoinable`/`Join`;
+an ordinary force-delete execution provider is rejected. The platform migration
+must implement this capability before the worker can run on that platform.
 
-- **Task** represents discrete asynchronous work.
-- **TaskExecutor** represents a persistent bounded worker used to execute many discrete work items without creating an execution context per message.
-- **Threads** remains the higher-level lifecycle abstraction for long-lived autonomous workers.
-
-## Platform independence
-
-ESPressio Task no longer depends directly on FreeRTOS or ESP32. Primitive execution, bounded queues and synchronization are supplied by ESPressio-System providers.
-
-On ESP32, the top-level application installs those providers through ESPressio-ESP32:
-
-```cpp
-#include <ESPressio_ESP32.hpp>
-
-ESPressio::ESP32Platform::InstallSystemProviders();
-```
-
-This keeps Task's lifecycle and asynchronous-work semantics reusable on future hardware/runtime implementations.
-
-## Lifecycle
-
-Constructors never execute user work. `TaskExecutor::Initialize()` reserves the queue and worker resources, but the worker remains behind a start gate until `Start()` is called. This makes it safe to reserve execution resources early during application setup without allowing work to escape before dependencies are ready.
-
-## Typed bounded executors
-
-`TaskExecutor<TWorkItem>` requires a trivially-copyable work item. The installed System queue provider stores fixed-size work items directly and deterministically rather than retaining heap-allocating callable captures on the hot path.
+## Single-slot work
 
 ```cpp
 #include <ESPressio_Task.hpp>
-
-struct WorkItem {
-    uint32_t Id;
-    uint8_t Value;
+using namespace ESPressio::Task;
+struct Work { unsigned Index; };
+struct Owner {
+    IdleWorkerTask<Work> Worker;
+    void Execute(Work& work) noexcept { (void)work.Index; }
+    void Released(IdleWorkerTask<Work>& worker) noexcept {
+        // An owner with an independently bounded FIFO may try its oldest item here.
+        // Retain that item if TryAssign reports Busy. No payload is supplied by T1.
+        (void)worker;
+    }
+    TaskExecutionStatus Initialize() {
+        TaskExecutionConfiguration execution;
+        execution.Name = "dispatchLane";
+        execution.StackSize = 4096;
+        execution.Priority = 2;
+        execution.Core = -1;
+        return Worker.Initialize<Owner, &Owner::Execute, &Owner::Released>(*this, execution);
+    }
 };
-
-ESPressio::Task::TaskConfiguration configuration;
-configuration.Name = "exampleExecutor";
-configuration.StackSize = 4096;
-configuration.QueueDepth = 8;
-
-ESPressio::Task::TaskExecutor<WorkItem> executor(configuration);
-
-void setup() {
-    executor.Initialize([](const WorkItem& item) {
-        // asynchronous processing
-    });
-    executor.Start();
-
-    executor.Submit(WorkItem{1, 42});
+void SubmitAndCancel(Owner& owner) {
+    Work item{7};
+    auto admitted = owner.Worker.TryAssign(std::move(item));
+    if (admitted) {
+        auto cancelled = owner.Worker.Cancel(admitted.Handle);
+        // Cancelled means the exact Ready descriptor was destroyed. InProgress
+        // means execution already claimed it. Stale cannot target later work.
+        (void)cancelled;
+    }
 }
 ```
 
-## Queue saturation
+Construction is inert. Successful `Initialize` already leaves the worker Idle;
+there is no Start operation. `TryAssign` never waits for a lock or consumes a
+rejected source. Work may be move-only and own a family-pool lease, but move
+construction and destruction must be noexcept. Handler/refill bindings contain
+only an owner pointer and fixed noexcept function pointers. Application exception
+translation belongs inside the domain's thunk.
 
-Available policies are `Reject`, `DropOldest`, `DropNewest`, and `Block`. Queues are always bounded; ESPressio Task never grows an unbounded pending-work collection.
+`TaskWorkSubmission` carries status and a non-owning `TaskWorkHandle`. Handles are
+worker-scoped and generation-tagged; generations never reset on reinitialization
+or wrap. A handle must not outlive its worker object. `Cancel` may return Busy
+under contention and never interrupts Executing work. Descriptor destruction
+precedes Idle publication and each configured release hook. Cancellation release
+notifications use one fixed counter, not work-item storage. Hooks execute in the
+worker context, including cancellation hooks.
 
-For the `Block` policy, the optional second argument to `Submit()` is now expressed in **milliseconds**, not native RTOS ticks:
+`Shutdown()` closes admission, suppresses future release-hook claims, discards
+Ready work, waits for the one executing handler/already-claimed hook, and joins
+the context. It returns the worker to Uninitialized. Self-shutdown returns
+`SelfJoin`; concurrent shutdown returns Busy. Never destroy a worker from its own
+handler. A failed provider join retains resources for an external retry.
+
+`IsInitialized`, `IsIdle`, `IsCurrentExecution` and `GetStatistics` are fixed
+queries. Statistics report assignments, completions, rejection, cancellation,
+shutdown discard and stack headroom; successful Initialize resets counters.
+Stack/control resources and the single signal are allocated only at Initialize.
+The inline descriptor and state are included in `sizeof(IdleWorkerTask<T>)`.
+
+## Explicit bounded FIFO
 
 ```cpp
-executor.Submit(item, 25); // block for up to 25 ms
+#include <ESPressio_Task.hpp>
+using namespace ESPressio::Task;
+struct QueueOwner {
+    static TaskExecutorConfiguration Configuration() {
+        TaskExecutorConfiguration c;
+        c.Execution.Name = "queuedWork";
+        c.Execution.StackSize = 3072;
+        c.QueueDepth = 8;
+        c.OverflowPolicy = TaskQueueOverflowPolicy::Reject;
+        return c;
+    }
+    TaskExecutor<unsigned, 8> Executor{Configuration()};
+    void Execute(const unsigned& value) noexcept { (void)value; }
+    void Discard(const unsigned& value) noexcept { (void)value; }
+    TaskExecutionStatus Initialize() {
+        return Executor.Initialize<QueueOwner, &QueueOwner::Execute, &QueueOwner::Discard>(*this);
+    }
+};
+void StartAndSubmit(QueueOwner& owner) {
+    if (owner.Initialize() != TaskExecutionStatus::Success) return;
+    owner.Executor.Start();
+    owner.Executor.Submit(42);
+    auto statistics = owner.Executor.GetStatistics();
+    (void)statistics;
+    owner.Executor.Stop();
+}
 ```
 
-## Stack instrumentation
+`MaximumPending` defaults to 8 and is compile-time storage capacity; `QueueDepth`
+selects a positive admitted limit no larger than it. Queue records must be
+trivially copyable, nothrow default constructible and nothrow copy assignable.
+The FIFO consumes `sizeof(T) * MaximumPending` inline bytes, plus fixed indices;
+the worker owns one separate Work lease/slot and one stack. There is no queue
+allocation or growth. `QueueMemoryPolicy` supports Internal for inline backing;
+other requests fail explicitly. The composition owner chooses object placement.
 
-`GetStatistics()` reports submitted/completed/rejected/dropped counts together with configured stack size and the worker's lifetime minimum-free-stack value. The underlying platform measurement is provided through `System::Execution` rather than a native RTOS API.
+Two executor-owned binary signals support capacity waits and producer quiescence,
+in addition to the worker's one wake signal. These are created during Initialize.
+The executor Start gate admits no submissions until Start; the physical worker
+already exists. Every submission joins the FIFO and cannot bypass older work.
 
-## One-shot work
+Overflow policies:
 
-`Task::Run()` is available for infrequent fire-and-forget work. High-frequency communications and protocol paths should prefer `TaskExecutor` to avoid repeated execution-stack/control-block allocation.
+- Reject returns QueueFull and leaves existing work untouched.
+- DropNewest rejects the input, counts it as dropped, and invokes no discard hook
+  because the executor never owned it.
+- DropOldest reclaims the oldest queued accepted item through the fixed discard
+  thunk before admitting the new one; an executing/Ready worker item is protected.
+- Block waits on capacity for the finite millisecond budget passed to Submit,
+  such as `executor.Submit(item, 25)`. Stale wakes never restart that budget.
+  `UINT32_MAX` is rejected. A handler cannot block waiting for its own queue.
 
-## Processor affinity
+Discard thunks are bounded reclamation hooks and must not reenter the executor.
+`Stop` closes admission, wakes blocked producers, joins T1, and reclaims Ready and
+queued records through discard hooks. It does not run queued application handlers.
+Self-stop is a typed misuse; destruction requires a successful external stop.
 
-`TaskConfiguration::Core` remains the developer-facing compatibility setting for this generation. A negative value requests any processor; a non-negative value is translated to `System::ProcessorAffinity::Specific(...)`.
+## Low-level and one-shot execution
 
-Whether a target can honour affinity is a platform capability. ESPressio-ESP32 does so through its FreeRTOS execution provider.
+`TaskRuntime::Create` accepts queue-free `TaskExecutionConfiguration` and adapts it
+to the System execution provider. `CreateJoinable` explicitly uses a supplied
+provider whose lifetime spans the context and its join. Runtime diagnostics expose
+current handle and stack headroom without native RTOS types.
 
-## Memory policy
-
-`TaskConfiguration` continues to expose task memory policy. Internal execution stacks are supported by the current provider path. `External` remains explicit but returns `UnsupportedMemoryPolicy` until a provider contract exists that can guarantee safe external-stack lifecycle semantics across supported targets.
-
-## Architecture
-
-```text
-ESPressio-Task
-    |
-    +-- System::Execution
-    +-- System::Queue
-    +-- System::Synchronization
-             |
-             v
-       ESPressio-ESP32
-             |
-             v
-          FreeRTOS
+```cpp
+#include <ESPressio_Task.hpp>
+void RunInfrequentWork() {
+    ESPressio::Task::TaskExecutionConfiguration execution;
+    execution.Name = "oneShot";
+    auto status = ESPressio::Task::Task::Run([] { /* infrequent work */ }, execution);
+    (void)status;
+}
 ```
 
-Task consumers therefore do not include FreeRTOS headers or expose FreeRTOS handles.
+One-shot `Task::Run` intentionally allocates a new invocation/callable and physical
+context for every call. It is an explicit convenience, outside deterministic
+family/transport hot paths. No persistent executor stores `std::function`.
 
-## Coordinated development dependency
+This coordinated development branch consumes System `primitives_redesign`.
+No family dependency, compatibility configuration alias or version change is added.
 
-During this tranche, Task consumes:
-
-```ini
-https://github.com/ESPressio-Development-Platform/ESPressio-System.git#main
-```
-
-The Lab application remains responsible for installing the concrete ESP32 providers.
+Native validation: `cmake -S tests -B build -DESPRESSIO_SYSTEM_SOURCE_DIR=/path/to/ESPressio-System`, then `cmake --build build` and `ctest --test-dir build --output-on-failure`. The source checkout must use the coordinated branch.

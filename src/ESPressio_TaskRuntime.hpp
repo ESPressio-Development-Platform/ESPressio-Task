@@ -38,6 +38,8 @@ private:
         switch (status) {
             case System::PlatformStatus::Success:
                 return TaskExecutionStatus::Success;
+            case System::PlatformStatus::Unsupported:
+                return TaskExecutionStatus::UnsupportedExecutionProvider;
             case System::PlatformStatus::InvalidArgument:
                 return TaskExecutionStatus::InvalidConfiguration;
             default:
@@ -54,10 +56,10 @@ public:
     static TaskCreationResult Create(
         TaskEntry entry,
         void* parameter,
-        const TaskConfiguration& configuration
+        const TaskExecutionConfiguration& configuration
     ) {
         TaskCreationResult result;
-        if (entry == nullptr || configuration.StackSize == 0) {
+        if (entry == nullptr || configuration.StackSize == 0 || configuration.Core > 255 || configuration.MemoryPolicy > TaskMemoryPolicy::PreferExternal) {
             result.Status = TaskExecutionStatus::InvalidConfiguration;
             return result;
         }
@@ -81,7 +83,23 @@ public:
         );
         result.Status = MapCreationStatus(created.Result.Status);
         result.Handle = created.Handle;
+        if (result.Status==TaskExecutionStatus::Success && !created) result.Status=TaskExecutionStatus::TaskCreationFailed;
         return result;
+    }
+
+    /// <summary>Creates a cooperatively joinable context; unsupported providers fail without a force-delete fallback.</summary>
+    static TaskCreationResult CreateJoinable(TaskEntry entry, void* parameter,
+        const TaskExecutionConfiguration& configuration, System::Execution::IExecutionProvider& provider) {
+        if (!entry || configuration.StackSize == 0 || configuration.Core > 255 || configuration.MemoryPolicy > TaskMemoryPolicy::PreferExternal)
+            return {TaskExecutionStatus::InvalidConfiguration, System::Execution::InvalidExecutionHandle};
+        if (configuration.MemoryPolicy == TaskMemoryPolicy::External)
+            return {TaskExecutionStatus::UnsupportedMemoryPolicy, System::Execution::InvalidExecutionHandle};
+        System::Execution::ExecutionConfiguration native;
+        native.Name=configuration.Name; native.StackSizeBytes=configuration.StackSize; native.Priority=configuration.Priority;
+        native.Affinity=configuration.Core < 0 ? System::ProcessorAffinity::Any() :
+            System::ProcessorAffinity::Specific(static_cast<std::uint8_t>(configuration.Core));
+        const auto result=provider.CreateJoinable(entry,parameter,native);
+        return {result.Result.Status==System::PlatformStatus::Success && !result ? TaskExecutionStatus::TaskCreationFailed : MapCreationStatus(result.Result.Status),result.Handle};
     }
 
     /// <summary>Destroys the specified task execution context.</summary>

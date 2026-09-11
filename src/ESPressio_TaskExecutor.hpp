@@ -1,395 +1,187 @@
 #pragma once
-
+#include <array>
 #include <atomic>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <type_traits>
+#include <ESPressio_SystemPlatformClock.hpp>
+#include "ESPressio_IdleWorkerTask.hpp"
 
-#include <ESPressio_Memory.hpp>
-#include <ESPressio_Queue.hpp>
-#include <ESPressio_Synchronization.hpp>
-
-#include "ESPressio_TaskRuntime.hpp"
-#include "ESPressio_TaskTypes.hpp"
-
-namespace ESPressio {
-namespace Task {
-
-/// <summary>Executes trivially copyable work items on a dedicated queued worker task.</summary>
-/// <typeparam name="TWorkItem">Trivially copyable work-item type stored in the bounded queue.</typeparam>
-
-template <typename TWorkItem>
-class TaskExecutor {
-    static_assert(
-        std::is_trivially_copyable<TWorkItem>::value,
-        "TaskExecutor work items must be trivially copyable for deterministic bounded queue storage"
-    );
-
-public:
-    /// <summary>Callable invoked by the worker for each dequeued work item.</summary>
-    using Handler = std::function<void(const TWorkItem&)>;
-    /// <summary>Optional callback invoked when an accepted item is discarded without execution.</summary>
-    /// <remarks>This includes DropOldest eviction and queued work reclaimed during executor shutdown.</remarks>
-    using DiscardedHandler = std::function<void(const TWorkItem&)>;
-
-private:
-    TaskConfiguration _configuration;
-    Handler _handler;
-    DiscardedHandler _discardedHandler;
-    std::unique_ptr<System::Queue::IMessageQueue> _queue;
-    std::unique_ptr<System::Synchronization::ISignal> _startGate;
-    TaskHandle _task = System::Execution::InvalidExecutionHandle;
-    mutable System::Synchronization::Mutex _lifecycleMutex;
-    std::atomic<bool> _initialized{false};
-    std::atomic<bool> _started{false};
-    std::atomic<bool> _stopping{false};
-    std::atomic<bool> _stopInProgress{false};
-    std::atomic<uint32_t> _activeSubmissions{0};
-    std::atomic<uint64_t> _submitted{0};
-    std::atomic<uint64_t> _completed{0};
-    std::atomic<uint64_t> _rejected{0};
-    std::atomic<uint64_t> _dropped{0};
-    std::atomic<uint32_t> _minimumFreeStack{0};
-
-    static System::Memory::MemoryPolicy QueueMemoryPolicy(
-        TaskMemoryPolicy policy
-    ) noexcept {
-        switch (policy) {
-            case TaskMemoryPolicy::PreferExternal:
-                return System::Memory::MemoryPolicy::ExternalPreferred;
-            case TaskMemoryPolicy::External:
-                return System::Memory::MemoryPolicy::ExternalRequired;
-            case TaskMemoryPolicy::Internal:
-            default:
-                return System::Memory::MemoryPolicy::Internal;
-        }
-    }
-
-    static void _entry(void* parameter) {
-        auto* executor = static_cast<TaskExecutor*>(parameter);
-        if (executor != nullptr) {
-            executor->_run();
-        }
-        TaskRuntime::Delete(System::Execution::InvalidExecutionHandle);
-    }
-
-    void _run() {
-        if (_startGate == nullptr || _queue == nullptr) return;
-
-        if (!_startGate->Wait()) return;
-        if (_stopping.load(std::memory_order_acquire)) return;
-
-        TWorkItem item{};
-        while (!_stopping.load(std::memory_order_acquire)) {
-            const auto received = _queue->Receive(&item);
-            if (!received) continue;
-            if (_stopping.load(std::memory_order_acquire)) break;
-
-            try {
-                if (_handler) _handler(item);
-            } catch (...) {
-                // Executor isolation: work-item failures must not kill the worker.
-            }
-
-            _completed.fetch_add(1, std::memory_order_relaxed);
-            _minimumFreeStack.store(
-                TaskRuntime::MinimumFreeStack(System::Execution::InvalidExecutionHandle),
-                std::memory_order_relaxed
-            );
-        }
-    }
-
-    void DiscardItem(const TWorkItem& item) noexcept {
-        if (!_discardedHandler) return;
-        try {
-            _discardedHandler(item);
-        } catch (...) {
-            // Reclamation callbacks are isolated exactly like work handlers.
-        }
-    }
-
-
-class SubmissionGuard final {
-    private:
-        TaskExecutor& _owner;
-    public:
-        explicit SubmissionGuard(TaskExecutor& owner) noexcept : _owner(owner) {}
-        ~SubmissionGuard() {
-            _owner._activeSubmissions.fetch_sub(1, std::memory_order_acq_rel);
-        }
-        SubmissionGuard(const SubmissionGuard&) = delete;
-        SubmissionGuard& operator=(const SubmissionGuard&) = delete;
+namespace ESPressio::Task {
+/// <summary>One explicit fixed FIFO plus a reusable T1 worker; QueueDepth must fit MaximumPending.</summary>
+/// <remarks>Queue storage is inline in this object, never allocated or grown. The owner chooses the object's placement.
+/// The two executor signals provide blocking-producer capacity and submission quiescence; the T1 worker owns its one
+/// separate wake signal. Execution/discard bindings are fixed noexcept thunks. Stop never drains application work.</remarks>
+template<class TWorkItem,std::size_t MaximumPending=8> class TaskExecutor final {
+    static_assert(MaximumPending>0 && std::is_trivially_copyable_v<TWorkItem> &&
+                  std::is_nothrow_default_constructible_v<TWorkItem> && std::is_nothrow_copy_assignable_v<TWorkItem>,
+                  "TaskExecutor requires positive fixed capacity and nothrow trivial queue records");
+    TaskExecutorConfiguration _configuration;
+    std::array<TWorkItem,MaximumPending> _queue{};
+    std::size_t _head=0,_count=0,_submitters=0;
+    mutable System::Synchronization::Mutex _mutex;
+    bool _initialized=false,_started=false,_stopping=false,_joining=false;
+    void* _owner=nullptr;
+    void (*_handler)(void*,const TWorkItem&) noexcept=nullptr;
+    void (*_discard)(void*,const TWorkItem&) noexcept=nullptr;
+    std::unique_ptr<System::Synchronization::ISignal> _space,_submissionsDone;
+    std::atomic<std::uint64_t> _submitted{0},_completed{0},_rejected{0},_dropped{0};
+    /// Owned worker lease also reclaims a Ready assignment discarded by T1 shutdown.
+    struct Work {
+        TaskExecutor* Owner=nullptr;
+        TWorkItem Item{};
+        Work(TaskExecutor& owner,const TWorkItem& item) noexcept:Owner(&owner),Item(item) {}
+        Work(Work&& other) noexcept:Owner(other.Owner),Item(other.Item) { other.Owner=nullptr; }
+        Work(const Work&)=delete;
+        ~Work() noexcept { if (Owner) Owner->Discard(Item); }
     };
-
+    IdleWorkerTask<Work> _worker;
+    void Discard(const TWorkItem& item) noexcept {
+        ++_dropped; if (_discard) _discard(_owner,item);
+    }
+    void Execute(Work& work) noexcept {
+        work.Owner=nullptr; // Execution claims ownership; no discard after a handled record.
+        _handler(_owner,work.Item); ++_completed;
+    }
+    void Refill(IdleWorkerTask<Work>&) noexcept {
+        std::lock_guard<System::Synchronization::Mutex> lock(_mutex); Fill();
+    }
+    void Fill() noexcept {
+        if (!_started || _stopping || !_count) return;
+        Work next(*this,_queue[_head]);
+        const auto assigned=_worker.TryAssign(std::move(next));
+        if (!assigned) { next.Owner=nullptr; return; } // The FIFO still owns its unchanged head.
+        _queue[_head]=TWorkItem{}; _head=(_head+1)%_configuration.QueueDepth; --_count;
+        (void)_space->Give();
+    }
+    void LeaveSubmission() noexcept {
+        std::lock_guard<System::Synchronization::Mutex> lock(_mutex);
+        --_submitters;
+        if (_stopping) (void)_space->Give(); // Baton wakes every blocked submitter during quiescence.
+        if (!_submitters) (void)_submissionsDone->Give();
+    }
+    struct SubmissionGuard { TaskExecutor& Owner; ~SubmissionGuard() { Owner.LeaveSubmission(); } };
 public:
-    /// <summary>Creates an executor using the default task configuration.</summary>
-    TaskExecutor() = default;
-
-    /// <summary>Creates an executor using the supplied task configuration.</summary>
-    explicit TaskExecutor(TaskConfiguration configuration)
-        : _configuration(configuration) {}
-
-    /// <summary>Stops the worker and releases its runtime resources.</summary>
-    ~TaskExecutor() {
-        Stop();
-    }
-
-    TaskExecutor(const TaskExecutor&) = delete;
-    TaskExecutor& operator=(const TaskExecutor&) = delete;
-
-    /// <summary>Gets the configuration used to initialize and run this executor.</summary>
-    const TaskConfiguration& GetConfiguration() const {
-        return _configuration;
-    }
-
-    /// <summary>Creates the queue and worker task and installs the work-item handler.</summary>
-    /// <param name="handler">Handler invoked for each dequeued work item.</param>
-    /// <param name="discardedHandler">Optional callback invoked for accepted work discarded without execution.</param>
-    /// <returns>The initialization status.</returns>
-    /// <remarks>
-    /// <c>PreferExternal</c> keeps the execution stack on the platform-safe task path while requesting
-    /// externally preferred queue backing through ESPressio System. Platforms that cannot provide an
-    /// external-preferred queue transparently fall back to normal/internal queue creation. A strict
-    /// <c>External</c> task policy remains unsupported until the execution provider can guarantee that
-    /// both task-stack and ancillary runtime requirements are safe in external memory.
-    /// The discarded-item callback enables pointer/handle work-item patterns to reclaim their separately
-    /// owned payload both on queue eviction and when queued items are abandoned during shutdown.
-    /// Lifecycle publication and teardown are serialized so Submit/Start cannot observe queue or signal
-    /// resources while they are being replaced or released.
-    /// </remarks>
-    TaskExecutionStatus Initialize(
-        Handler handler,
-        DiscardedHandler discardedHandler = {}
-    ) {
-        std::lock_guard<System::Synchronization::Mutex> lifecycle(_lifecycleMutex);
-        if (
-            _initialized.load(std::memory_order_acquire) ||
-            _stopInProgress.load(std::memory_order_acquire)
-        ) {
-            return TaskExecutionStatus::AlreadyInitialized;
-        }
-        if (!handler || _configuration.StackSize == 0 || _configuration.QueueDepth == 0) {
+    explicit TaskExecutor(TaskExecutorConfiguration configuration={}) noexcept:_configuration(configuration) {}
+    TaskExecutor(const TaskExecutor&)=delete;
+    TaskExecutor& operator=(const TaskExecutor&)=delete;
+    ~TaskExecutor() { if (Stop()!=TaskExecutionStatus::Success) std::terminate(); }
+    /// <summary>Returns the immutable execution/backlog configuration.</summary>
+    const TaskExecutorConfiguration& GetConfiguration() const noexcept { return _configuration; }
+    /// <summary>Creates all signals and the T1 context, binding a fixed owner/member handler and optional discard thunk.</summary>
+    template<class TOwner,void (TOwner::*THandler)(const TWorkItem&) noexcept,
+             void (TOwner::*TDiscard)(const TWorkItem&) noexcept=nullptr>
+    TaskExecutionStatus Initialize(TOwner& owner) {
+        std::lock_guard<System::Synchronization::Mutex> lock(_mutex);
+        if (_initialized) return TaskExecutionStatus::AlreadyInitialized;
+        if (!_configuration.QueueDepth || _configuration.QueueDepth>MaximumPending || THandler==nullptr ||
+            _configuration.OverflowPolicy>TaskQueueOverflowPolicy::Block)
             return TaskExecutionStatus::InvalidConfiguration;
-        }
-        if (_configuration.MemoryPolicy == TaskMemoryPolicy::External) {
-            return TaskExecutionStatus::UnsupportedMemoryPolicy;
-        }
-
-        _handler = std::move(handler);
-        _discardedHandler = std::move(discardedHandler);
-        _stopping.store(false, std::memory_order_release);
-        _started.store(false, std::memory_order_release);
-
-        const auto queuePolicy = QueueMemoryPolicy(_configuration.MemoryPolicy);
-        _queue = System::Queue::Create<TWorkItem>(
-            _configuration.QueueDepth,
-            queuePolicy
-        );
-        if (
-            _queue == nullptr &&
-            _configuration.MemoryPolicy == TaskMemoryPolicy::PreferExternal
-        ) {
-            _queue = System::Queue::Create<TWorkItem>(
-                _configuration.QueueDepth,
-                System::Memory::MemoryPolicy::Internal
-            );
-        }
-        if (_queue == nullptr) {
-            _handler = {};
-            _discardedHandler = {};
-            return TaskExecutionStatus::QueueUnavailable;
-        }
-
-        _startGate = System::Synchronization::CreateBinarySignal();
-        if (_startGate == nullptr) {
-            _queue.reset();
-            _handler = {};
-            _discardedHandler = {};
-            return TaskExecutionStatus::QueueUnavailable;
-        }
-
-        const auto created = TaskRuntime::Create(_entry, this, _configuration);
-        if (!created) {
-            _startGate.reset();
-            _queue.reset();
-            _handler = {};
-            _discardedHandler = {};
-            return created.Status;
-        }
-
-        _task = created.Handle;
-        _minimumFreeStack.store(
-            TaskRuntime::MinimumFreeStack(_task),
-            std::memory_order_relaxed
-        );
-        _initialized.store(true, std::memory_order_release);
+        // This implementation has inline backing; it never silently changes the requested memory policy.
+        if (_configuration.QueueMemoryPolicy!=TaskMemoryPolicy::Internal) return TaskExecutionStatus::UnsupportedMemoryPolicy;
+        auto* provider=System::Synchronization::Provider();
+        if (!provider) return TaskExecutionStatus::SignalUnavailable;
+        try { _space=provider->CreateBinarySignal(false); _submissionsDone=provider->CreateBinarySignal(false); }
+        catch (...) { _space.reset(); _submissionsDone.reset(); return TaskExecutionStatus::SignalUnavailable; }
+        if (!_space || !_submissionsDone) { _space.reset(); _submissionsDone.reset(); return TaskExecutionStatus::SignalUnavailable; }
+        _owner=&owner;
+        _handler=[](void* context,const TWorkItem& item) noexcept { (static_cast<TOwner*>(context)->*THandler)(item); };
+        if constexpr (TDiscard!=nullptr) _discard=[](void* context,const TWorkItem& item) noexcept { (static_cast<TOwner*>(context)->*TDiscard)(item); };
+        const auto status=_worker.template Initialize<TaskExecutor,&TaskExecutor::Execute,&TaskExecutor::Refill>(*this,_configuration.Execution);
+        if (status!=TaskExecutionStatus::Success) { _space.reset(); _submissionsDone.reset(); _owner=nullptr; _handler=nullptr; _discard=nullptr; return status; }
+        _head=0; _count=0; _submitters=0; _started=false; _stopping=false; _joining=false;
+        _submitted=0; _completed=0; _rejected=0; _dropped=0; _initialized=true;
         return TaskExecutionStatus::Success;
     }
-
-    /// <summary>Releases the initialized worker to begin consuming queued work.</summary>
-    /// <returns>The start status.</returns>
-    TaskExecutionStatus Start() {
-        std::lock_guard<System::Synchronization::Mutex> lifecycle(_lifecycleMutex);
-        if (
-            !_initialized.load(std::memory_order_acquire) ||
-            _stopInProgress.load(std::memory_order_acquire)
-        ) {
-            return TaskExecutionStatus::NotInitialized;
-        }
-        bool expected = false;
-        if (!_started.compare_exchange_strong(expected, true)) {
-            return TaskExecutionStatus::AlreadyStarted;
-        }
-        if (_startGate == nullptr || !_startGate->Give()) {
-            _started.store(false, std::memory_order_release);
-            return TaskExecutionStatus::QueueUnavailable;
-        }
-        return TaskExecutionStatus::Success;
+    /// <summary>Opens the executor admission/dispatch gate; the underlying worker already exists.</summary>
+    TaskExecutionStatus Start() noexcept {
+        std::lock_guard<System::Synchronization::Mutex> lock(_mutex);
+        if (!_initialized || _stopping) return TaskExecutionStatus::NotInitialized;
+        if (_started) return TaskExecutionStatus::AlreadyStarted;
+        _started=true; Fill(); return TaskExecutionStatus::Success;
     }
-
-    /// <summary>Stops the worker, reclaims queued work, and releases runtime resources.</summary>
-    /// <remarks>New submissions are rejected first. Already admitted submissions leave their queue operation before teardown. Any accepted item still queued after the worker stops is passed to the discarded-item callback before queue storage is released.</remarks>
-    void Stop() {
-        bool waitForOtherStop = false;
+    /// <summary>Copies into the explicit FIFO under the selected overflow policy; newer work never bypasses an older head.</summary>
+    /// <remarks>Block uses one finite monotonic budget and a capacity signal, without a polling task or retry sleeps.
+    /// DropNewest rejects the caller-owned input. DropOldest calls the fixed discard thunk for the evicted accepted item.
+    /// A caller in this executor's handler may submit non-blocking work but cannot wait for its own queue capacity.</remarks>
+    TaskExecutionStatus Submit(const TWorkItem& item,std::uint32_t blockMilliseconds=0) noexcept {
         {
-            std::lock_guard<System::Synchronization::Mutex> lifecycle(_lifecycleMutex);
-            if (!_initialized.load(std::memory_order_acquire)) return;
-            if (_stopInProgress.exchange(true, std::memory_order_acq_rel)) {
-                waitForOtherStop = true;
-            } else {
-                _started.store(false, std::memory_order_release);
-            }
+            std::lock_guard<System::Synchronization::Mutex> lock(_mutex);
+            if (!_initialized || _stopping) return TaskExecutionStatus::NotInitialized;
+            if (!_started) return TaskExecutionStatus::NotStarted;
+            if (blockMilliseconds==UINT32_MAX) return TaskExecutionStatus::InvalidConfiguration;
+            ++_submitters;
         }
-
-        if (waitForOtherStop) {
-            while (_initialized.load(std::memory_order_acquire)) {
-                TaskRuntime::Yield();
-            }
-            return;
-        }
-
-        while (_activeSubmissions.load(std::memory_order_acquire) != 0) {
-            TaskRuntime::Yield();
-        }
-
-        TaskHandle task = System::Execution::InvalidExecutionHandle;
-        {
-            std::lock_guard<System::Synchronization::Mutex> lifecycle(_lifecycleMutex);
-            _stopping.store(true, std::memory_order_release);
-            if (_startGate != nullptr) (void)_startGate->Give();
-            task = _task;
-            _task = System::Execution::InvalidExecutionHandle;
-        }
-
-        if (task != System::Execution::InvalidExecutionHandle) {
-            TaskRuntime::Delete(task);
-        }
-
-        {
-            std::lock_guard<System::Synchronization::Mutex> lifecycle(_lifecycleMutex);
-            if (_queue != nullptr) {
-                TWorkItem discarded{};
-                while (_queue->Receive(&discarded, 0)) {
-                    _dropped.fetch_add(1, std::memory_order_relaxed);
-                    DiscardItem(discarded);
-                }
-            }
-            _startGate.reset();
-            _queue.reset();
-            _discardedHandler = {};
-            _handler = {};
-            _initialized.store(false, std::memory_order_release);
-            _stopping.store(false, std::memory_order_release);
-            _stopInProgress.store(false, std::memory_order_release);
-        }
-    }
-
-    /// <summary>Submits a work item according to the configured queue-overflow policy.</summary>
-    /// <param name="item">Work item copied into the executor queue.</param>
-    /// <param name="blockMilliseconds">Maximum queue wait used by the blocking overflow policy.</param>
-    /// <returns>The work-submission status.</returns>
-    TaskExecutionStatus Submit(
-        const TWorkItem& item,
-        uint32_t blockMilliseconds = 0
-    ) {
-        System::Queue::IMessageQueue* queue = nullptr;
-        {
-            std::lock_guard<System::Synchronization::Mutex> lifecycle(_lifecycleMutex);
-            if (
-                !_initialized.load(std::memory_order_acquire) ||
-                _stopInProgress.load(std::memory_order_acquire)
-            ) {
-                return TaskExecutionStatus::NotInitialized;
-            }
-            if (!_started.load(std::memory_order_acquire)) {
-                return TaskExecutionStatus::NotStarted;
-            }
-            if (_queue == nullptr) {
-                return TaskExecutionStatus::QueueUnavailable;
-            }
-            _activeSubmissions.fetch_add(1, std::memory_order_acq_rel);
-            queue = _queue.get();
-        }
-        SubmissionGuard submission(*this);
-
-        System::PlatformResult queued = System::PlatformResult::Failed(
-            System::PlatformStatus::Busy
-        );
-
-        switch (_configuration.OverflowPolicy) {
-            case TaskQueueOverflowPolicy::Reject:
-                queued = queue->Send(&item, 0);
-                break;
-
-            case TaskQueueOverflowPolicy::DropNewest:
-                queued = queue->Send(&item, 0);
-                if (!queued) {
-                    _dropped.fetch_add(1, std::memory_order_relaxed);
-                    return TaskExecutionStatus::QueueFull;
-                }
-                break;
-
-            case TaskQueueOverflowPolicy::DropOldest: {
-                queued = queue->Send(&item, 0);
-                if (!queued) {
-                    TWorkItem discarded{};
-                    if (queue->Receive(&discarded, 0)) {
-                        _dropped.fetch_add(1, std::memory_order_relaxed);
-                        DiscardItem(discarded);
+        SubmissionGuard guard{*this};
+        const auto start=System::Clock::Monotonic().NowNanoseconds();
+        const auto budget=std::uint64_t(blockMilliseconds)*1000000;
+        for (;;) {
+            std::uint32_t wait=0;
+            {
+                std::lock_guard<System::Synchronization::Mutex> lock(_mutex);
+                if (_stopping) return TaskExecutionStatus::Stopping;
+                Fill();
+                if (_count==_configuration.QueueDepth) {
+                    switch (_configuration.OverflowPolicy) {
+                        case TaskQueueOverflowPolicy::DropOldest:
+                            Discard(_queue[_head]); _head=(_head+1)%_configuration.QueueDepth; --_count; break;
+                        case TaskQueueOverflowPolicy::DropNewest:
+                            ++_dropped; ++_rejected; return TaskExecutionStatus::QueueFull;
+                        case TaskQueueOverflowPolicy::Reject:
+                            ++_rejected; return TaskExecutionStatus::QueueFull;
+                        case TaskQueueOverflowPolicy::Block: {
+                            if (_worker.IsCurrentExecution() && blockMilliseconds) return TaskExecutionStatus::SelfJoin;
+                            const auto elapsed=System::Clock::Monotonic().NowNanoseconds()-start;
+                            if (elapsed>=budget) { ++_rejected; return TaskExecutionStatus::QueueFull; }
+                            wait=static_cast<std::uint32_t>((budget-elapsed+999999)/1000000); break;
+                        }
                     }
-                    queued = queue->Send(&item, 0);
                 }
-                break;
+                if (!wait) {
+                    _queue[(_head+_count)%_configuration.QueueDepth]=item; ++_count; ++_submitted;
+                    Fill();
+                    if (_count<_configuration.QueueDepth) (void)_space->Give();
+                    return TaskExecutionStatus::Success;
+                }
             }
-
-            case TaskQueueOverflowPolicy::Block:
-                queued = queue->Send(&item, blockMilliseconds);
-                break;
+            (void)_space->Wait(wait); // Spurious/stale wakeups consume the same original finite budget.
         }
-
-        if (!queued) {
-            _rejected.fetch_add(1, std::memory_order_relaxed);
-            return TaskExecutionStatus::QueueFull;
+    }
+    /// <summary>Closes admissions, cooperatively joins the worker, then discards bounded backlog and releases signals.</summary>
+    TaskExecutionStatus Stop() noexcept {
+        if (_worker.IsCurrentExecution()) return TaskExecutionStatus::SelfJoin;
+        {
+            std::lock_guard<System::Synchronization::Mutex> lock(_mutex);
+            if (!_initialized) return TaskExecutionStatus::Success;
+            if (_joining) return TaskExecutionStatus::Busy;
+            _joining=true; _stopping=true; _started=false;
+            (void)_space->Give();
         }
-
-        _submitted.fetch_add(1, std::memory_order_relaxed);
+        const auto status=_worker.Shutdown();
+        if (status!=TaskExecutionStatus::Success) {
+            std::lock_guard<System::Synchronization::Mutex> lock(_mutex); _joining=false; return status;
+        }
+        for (;;) {
+            { std::lock_guard<System::Synchronization::Mutex> lock(_mutex); if (!_submitters) break; }
+            (void)_submissionsDone->Wait();
+        }
+        std::lock_guard<System::Synchronization::Mutex> lock(_mutex);
+        while (_count) {
+            Discard(_queue[_head]); _queue[_head]=TWorkItem{};
+            _head=(_head+1)%_configuration.QueueDepth; --_count;
+        }
+        _space.reset(); _submissionsDone.reset(); _initialized=false; _joining=false;
+        _owner=nullptr; _handler=nullptr; _discard=nullptr;
         return TaskExecutionStatus::Success;
     }
-
-    /// <summary>Gets a snapshot of cumulative work and stack diagnostics.</summary>
-    TaskExecutionStatistics GetStatistics() const {
-        TaskExecutionStatistics statistics;
-        statistics.Submitted = _submitted.load(std::memory_order_relaxed);
-        statistics.Completed = _completed.load(std::memory_order_relaxed);
-        statistics.Rejected = _rejected.load(std::memory_order_relaxed);
-        statistics.Dropped = _dropped.load(std::memory_order_relaxed);
-        statistics.ConfiguredStackSize = _configuration.StackSize;
-        statistics.MinimumFreeStack = _minimumFreeStack.load(std::memory_order_relaxed);
-        return statistics;
+    /// <summary>Returns independent fixed cumulative activity counters and the underlying worker's stack telemetry.</summary>
+    TaskExecutionStatistics GetStatistics() const noexcept {
+        auto result=_worker.GetStatistics();
+        result.Submitted=_submitted; result.Completed=_completed; result.Rejected=_rejected; result.Dropped=_dropped;
+        return result;
     }
+    /// <summary>Compile-time FIFO storage; the single executing/Ready T1 slot is separately accounted.</summary>
+    static constexpr std::size_t MaximumPendingItems=MaximumPending;
 };
-
-}
 }

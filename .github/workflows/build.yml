@@ -2,10 +2,27 @@ name: Task Build
 
 on:
   push:
-    branches: [ main, 'feature/**', 'bugfix/**', 'optimisation/**' ]
+    branches: [ main, primitives_redesign, 'feature/**', 'bugfix/**', 'optimisation/**' ]
   pull_request:
 
 jobs:
+  host-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ESPressio-Task
+      - uses: actions/checkout@v4
+        with:
+          repository: ESPressio-Development-Platform/ESPressio-System
+          ref: primitives_redesign
+          path: ESPressio-System
+      - name: Configure and build native contracts
+        run: |
+          cmake -S ESPressio-Task/tests -B build
+          cmake --build build --parallel
+      - name: Validate worker, FIFO and rejected contracts
+        run: ctest --test-dir build --output-on-failure
   esp32-build:
     runs-on: ubuntu-latest
     steps:

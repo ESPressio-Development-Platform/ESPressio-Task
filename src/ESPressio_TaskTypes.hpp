@@ -35,12 +35,19 @@ enum class TaskExecutionStatus : uint8_t {
     QueueFull,
     TaskCreationFailed,
     InvalidConfiguration,
-    UnsupportedMemoryPolicy
+    UnsupportedMemoryPolicy,
+    UnsupportedExecutionProvider,
+    SignalUnavailable,
+    Busy,
+    Stopping,
+    SelfJoin,
+    GenerationExhausted,
+    JoinFailed
 };
 
-/// <summary>Configures execution, queueing, affinity, and memory policy for an ESPressio task.</summary>
+/// <summary>Configures one physical execution context without queue capacity or overflow policy.</summary>
 
-struct TaskConfiguration {
+struct TaskExecutionConfiguration {
     /// <summary>Diagnostic name assigned to the underlying execution context.</summary>
     const char* Name = "espressioTask";
     /// <summary>Requested task stack size in bytes.</summary>
@@ -49,17 +56,19 @@ struct TaskConfiguration {
     uint32_t Priority = 1;
     /// <summary>Requested processor index, or a negative value for no fixed affinity.</summary>
     int32_t Core = -1;
-    /// <summary>Maximum number of work items retained by an executor queue.</summary>
-    size_t QueueDepth = 8;
-    /// <summary>Behaviour applied when the executor queue has no free capacity.</summary>
-    TaskQueueOverflowPolicy OverflowPolicy = TaskQueueOverflowPolicy::Reject;
     /// <summary>Memory-placement policy requested for task runtime resources.</summary>
-    /// <remarks>
-    /// The default prefers external memory for allocator-capable ancillary resources such as executor queue backing.
-    /// Task stacks remain on the platform-safe execution path unless a platform explicitly implements a safe external
-    /// stack policy; the current ESP32 implementation therefore keeps FreeRTOS stacks internal.
-    /// </remarks>
+    /// <remarks>Execution policy is separate from queued storage. PreferExternal permits the platform-safe internal
+    /// stack path; External is rejected until an execution provider can guarantee safe external-stack lifecycle.</remarks>
     TaskMemoryPolicy MemoryPolicy = TaskMemoryPolicy::PreferExternal;
+};
+
+/// <summary>Composes physical execution with one separately bounded executor backlog.</summary>
+struct TaskExecutorConfiguration {
+    TaskExecutionConfiguration Execution{};
+    std::size_t QueueDepth = 8;
+    TaskQueueOverflowPolicy OverflowPolicy = TaskQueueOverflowPolicy::Reject;
+    /// <summary>Queue allocation policy, applied once during Initialize without a hidden fallback.</summary>
+    TaskMemoryPolicy QueueMemoryPolicy = TaskMemoryPolicy::Internal;
 };
 
 /// <summary>Captures cumulative executor activity and stack headroom diagnostics.</summary>
@@ -73,6 +82,8 @@ struct TaskExecutionStatistics {
     uint64_t Rejected = 0;
     /// <summary>Total number of work items discarded by a drop policy.</summary>
     uint64_t Dropped = 0;
+    /// <summary>Ready assignments cancelled before execution.</summary>
+    uint64_t Cancelled = 0;
     /// <summary>Configured task stack size in bytes.</summary>
     uint32_t ConfiguredStackSize = 0;
     /// <summary>Minimum observed free stack capacity in bytes.</summary>
