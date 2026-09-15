@@ -16,7 +16,7 @@ class HostRuntime final : public ESPressio::System::Execution::IExecutionProvide
     using Status=ESPressio::System::PlatformStatus;
     using Handle=ESPressio::System::Execution::ExecutionHandle;
     struct Context { std::thread Thread; bool Used=false; };
-    std::array<Context,8> _contexts{};
+    std::array<Context,32> _contexts{};
     mutable std::mutex _gateMutex;
     std::condition_variable _gate;
     bool _paused=false;
