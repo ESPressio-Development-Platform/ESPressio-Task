@@ -26,6 +26,8 @@ template<class TWorkItem> class IdleWorkerTask final {
     std::atomic<bool> _stopping{false};
     bool _joining=false;
     std::uint64_t _generation=0;
+    // Only release notifications, never descriptors or additional assignment capacity.
+    // At most one notification per unique generation can be pending, so this cannot wrap.
     std::atomic<std::uint64_t> _released{0};
     void* _owner=nullptr;
     void (*_execute)(void*,TWorkItem&) noexcept=nullptr;
@@ -46,9 +48,15 @@ template<class TWorkItem> class IdleWorkerTask final {
     TWorkItem& Item() noexcept { return *std::launder(reinterpret_cast<TWorkItem*>(_slot)); }
     static void Entry(void* context) { static_cast<IdleWorkerTask*>(context)->Run(); }
     void Run() noexcept {
+        // Creation may enter this context before Initialize publishes Idle.
+        // Wait on the same latch rather than entering the admission mutex with
+        // an obsolete Uninitialized observation. Once Idle is visible, this
+        // startup path never contends with the first source assignment.
         while (_state.load(std::memory_order_acquire)==State::Uninitialized)
             (void)_wake->Wait();
         for (;;) {
+            // Idle inspection never holds the admission lock. This also prevents
+            // a refill attempt from losing progress to a diagnostic/idle read.
             if (_state==State::Idle && !_stopping && _released==0) {
                 (void)_wake->Wait();
                 continue;
@@ -60,12 +68,14 @@ template<class TWorkItem> class IdleWorkerTask final {
                 if (_stopping) {
                     if (_state==State::Ready) { Item().~TWorkItem(); ++_statistics.Dropped; }
                     _state=State::Idle; _released=0;
-                    return;
+                    return; // Provider trampoline owns termination; external Join reclaims it.
                 }
                 if (_released) { --_released; refill=_refill; }
                 else if (_state==State::Ready) { _state=State::Executing; execute=true; }
             }
             if (refill) {
+                // Claim was serialized before Shutdown. Shutdown waits for this already-claimed
+                // owner hook through Join; no later hook is claimed once stopping is published.
                 refill(_owner,*this);
                 continue;
             }
@@ -80,6 +90,8 @@ template<class TWorkItem> class IdleWorkerTask final {
                 if (!_stopping && _refill) ++_released;
                 continue;
             }
+            // Ready/stop publication always precedes Give. A coalesced or stale signal
+            // is harmless: the next iteration rechecks the slot and release state.
             (void)_wake->Wait();
         }
     }
@@ -87,11 +99,13 @@ public:
     IdleWorkerTask() noexcept = default;
     IdleWorkerTask(const IdleWorkerTask&)=delete;
     IdleWorkerTask& operator=(const IdleWorkerTask&)=delete;
+    /// <summary>Externally joins the worker; destroying it from its own handler is fatal misuse.</summary>
     ~IdleWorkerTask() { if (Shutdown()!=TaskExecutionStatus::Success) std::terminate(); }
+    /// <summary>Transactionally binds fixed thunks and creates the signal/context; success leaves an accepting Idle worker.</summary>
     template<class TOwner,void (TOwner::*TExecute)(TWorkItem&) noexcept,
              void (TOwner::*TOnSlotReleased)(IdleWorkerTask&) noexcept=nullptr>
     TaskExecutionStatus Initialize(TOwner& owner,TaskExecutionConfiguration configuration={}) {
-        std::lock_guard<System::Synchronization::Mutex> lock(_mutex);
+        std::lock_guard<System::Synchronization::Mutex> lock(_mutex); // Resolves the mutex before any hot path.
         if (_state!=State::Uninitialized) return TaskExecutionStatus::AlreadyInitialized;
         if (!configuration.StackSize || configuration.Core>255 || TExecute==nullptr)
             return TaskExecutionStatus::InvalidConfiguration;
@@ -115,9 +129,10 @@ public:
         _statistics.Reset(); _statistics.ConfiguredStackSize=configuration.StackSize;
         _statistics.MinimumFreeStack=_provider->MinimumFreeStackBytes(_task);
         _stopping=false; _joining=false; _released=0; _state=State::Idle;
-        (void)_wake->Give();
+        (void)_wake->Give(); // Releases an entry that ran before publication.
         return TaskExecutionStatus::Success;
     }
+    /// <summary>Attempts one admission without waiting for a lock or consuming a rejected source.</summary>
     TaskWorkSubmission TryAssign(TWorkItem&& item) noexcept {
         std::unique_lock<System::Synchronization::Mutex> lock(_mutex,std::try_to_lock);
         if (!lock.owns_lock()) { ++_statistics.Rejected; return {TaskExecutionStatus::Busy,{}}; }
@@ -130,6 +145,7 @@ public:
         (void)_wake->Give();
         return {TaskExecutionStatus::Success,{this,_generation}};
     }
+    /// <summary>Cancels only this worker's exact Ready generation, destroying its lease before publishing Idle.</summary>
     TaskWorkCancelStatus Cancel(TaskWorkHandle handle) noexcept {
         const auto state=_state.load();
         if (state==State::Uninitialized) return TaskWorkCancelStatus::NotInitialized;
@@ -146,6 +162,8 @@ public:
         (void)_wake->Give();
         return TaskWorkCancelStatus::Cancelled;
     }
+    /// <summary>Rejects admissions, suppresses future refill, discards Ready work and cooperatively joins current execution.</summary>
+    /// <remarks>Concurrent shutdown callers receive Busy. A failed provider Join retains resources for a later retry.</remarks>
     TaskExecutionStatus Shutdown() noexcept {
         {
             std::lock_guard<System::Synchronization::Mutex> lock(_mutex);
@@ -164,9 +182,13 @@ public:
         _wake.reset(); _provider=nullptr; _owner=nullptr; _execute=nullptr; _refill=nullptr;
         return TaskExecutionStatus::Success;
     }
+    /// <summary>Identifies self-join or blocking-on-self misuse; provider installation remains fixed during ownership.</summary>
     bool IsCurrentExecution() const noexcept { const auto task=_task.load(); return task && TaskRuntime::Current()==task; }
+    /// <summary>Reports whether platform resources remain owned, including while stopping.</summary>
     bool IsInitialized() const noexcept { return _state!=State::Uninitialized; }
+    /// <summary>Reports current Idle admission state; another producer can win immediately afterward.</summary>
     bool IsIdle() const noexcept { return _state==State::Idle && !_stopping; }
+    /// <summary>Returns fixed cumulative counters and platform stack headroom; reset only by successful Initialize.</summary>
     TaskExecutionStatistics GetStatistics() const noexcept { return _statistics.Read(); }
 };
 }
