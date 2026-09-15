@@ -87,7 +87,8 @@ public:
         if (!_space || !_submissionsDone) { _space.reset(); _submissionsDone.reset(); return TaskExecutionStatus::SignalUnavailable; }
         _owner=&owner;
         _handler=[](void* context,const TWorkItem& item) noexcept { (static_cast<TOwner*>(context)->*THandler)(item); };
-        if constexpr (TDiscard!=nullptr) _discard=[](void* context,const TWorkItem& item) noexcept { (static_cast<TOwner*>(context)->*TDiscard)(item); };
+        if (TDiscard!=nullptr) _discard=[](void* context,const TWorkItem& item) noexcept { (static_cast<TOwner*>(context)->*TDiscard)(item); };
+        else _discard=nullptr;
         const auto status=_worker.template Initialize<TaskExecutor,&TaskExecutor::Execute,&TaskExecutor::Refill>(*this,_configuration.Execution);
         if (status!=TaskExecutionStatus::Success) { _space.reset(); _submissionsDone.reset(); _owner=nullptr; _handler=nullptr; _discard=nullptr; return status; }
         _head=0; _count=0; _submitters=0; _started=false; _stopping=false; _joining=false;
